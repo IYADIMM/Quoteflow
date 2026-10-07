@@ -1,0 +1,30 @@
+{
+  "name": "quoteflow",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "dev": "npm run build && prisma migrate deploy && netlify dev",
+    "start": "netlify dev",
+    "build": "prisma generate && node scripts/build.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "test:unit": "node --test tests/pricing.test.mjs tests/contracts.test.mjs tests/ai-provider.test.mjs",
+    "test:integration": "node --test tests/api.integration.test.mjs",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate deploy",
+    "db:validate": "prisma validate",
+    "db:dev": "prisma migrate dev"
+  },
+  "dependencies": {
+    "@google/genai": "^1.36.0",
+    "@prisma/adapter-pg": "^7.0.0",
+    "@prisma/client": "^7.0.0",
+    "dotenv": "^16.4.7",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "netlify-cli": "^23.5.0",
+    "prisma": "^7.0.0"
+  }
+}
