@@ -135,17 +135,18 @@ export function createHandler(dependencies = {}) {
   }
   if (path === '/auth/login' && method === 'POST') {
     const email = String(body.email || '').trim().toLowerCase();
-    const user = await prisma.user.findUnique({ where: { email }, include: { memberships: { orderBy: { createdAt: 'asc' }, take: 1 } } });
+    const user = await prisma.user.findUnique({ where: { email }, include: { memberships: { include: { organization: true }, orderBy: { createdAt: 'asc' } } } });
     if (!user || typeof body.password !== 'string') return json(401, { error: 'Email or password is incorrect.' });
     const [saltHex, expectedHex] = user.passwordHash.split(':');
     if (!saltHex || !expectedHex) return json(401, { error: 'Email or password is incorrect.' });
     const actual = Buffer.from(await scrypt(body.password, Buffer.from(saltHex, 'hex'), 64));
     const expected = Buffer.from(expectedHex, 'hex');
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return json(401, { error: 'Email or password is incorrect.' });
-    const membership = user.memberships[0]; if (!membership) return json(403, { error: 'This account has no organization membership.' });
+    const memberships = user.memberships; if (!memberships.length) return json(403, { error: 'This account has no organization membership.' });
+    const membership = memberships[0];
     const sessionToken = randomBytes(32).toString('base64url');
     await prisma.session.create({ data: { tokenHash: sha256(sessionToken), userId: user.id, organizationId: membership.organizationId, expiresAt: new Date(Date.now() + 30 * 864e5) } });
-    return json(200, { user: { id: user.id, email: user.email } }, { 'set-cookie': authCookies(sessionToken, config.production) });
+    return json(200, { user: { id: user.id, email: user.email }, memberships: memberships.map(m => ({ organizationId: m.organizationId, name: m.organization.name, role: m.role })) }, { 'set-cookie': authCookies(sessionToken, config.production) });
   }
   if (path === '/auth/logout' && method === 'POST') {
     const token = /(?:^|;\s*)qf_session=([^;]+)/.exec(event.headers.cookie || '')?.[1];
@@ -233,7 +234,20 @@ export function createHandler(dependencies = {}) {
   const principal = await authenticate(event, prisma);
   if (!principal) return json(401, { error: 'Authentication required.' });
   const { user, organization, role } = principal;
-  if (path === '/auth/me' && method === 'GET') return json(200, { user: { id: user.id, email: user.email }, organization: { id: organization.id, name: organization.name, currency: organization.reportingCurrency }, role });
+  if (path === '/auth/me' && method === 'GET') {
+    const memberships = await prisma.membership.findMany({ where: { userId: user.id }, include: { organization: { select: { id: true, name: true, reportingCurrency: true } } }, orderBy: { createdAt: 'asc' } });
+    return json(200, { user: { id: user.id, email: user.email }, organization: { id: organization.id, name: organization.name, currency: organization.reportingCurrency }, role, memberships: memberships.map(m => ({ organizationId: m.organizationId, name: m.organization.name, role: m.role })) });
+  }
+  if (path === '/auth/switch-organization' && method === 'POST') {
+    const organizationId = String(body.organizationId || '').trim();
+    if (!organizationId || organizationId.length > 128) return json(400, { error: 'Choose a valid organization.' });
+    const membership = await prisma.membership.findUnique({ where: { userId_organizationId: { userId: user.id, organizationId } }, include: { organization: true } });
+    if (!membership) return json(403, { error: 'You do not have access to that organization.' });
+    const changed = await prisma.session.updateMany({ where: { id: principal.session.id, userId: user.id, expiresAt: { gt: new Date() } }, data: { organizationId } });
+    if (!changed.count) return json(401, { error: 'Your session has expired. Sign in again.' });
+    await prisma.auditLog.create({ data: { organizationId, actorUserId: user.id, action: 'auth.organization_switched', objectType: 'Organization', objectId: organizationId, metadata: { previousOrganizationId: organization.id } } });
+    return json(200, { organization: { id: membership.organization.id, name: membership.organization.name, currency: membership.organization.reportingCurrency }, role: membership.role });
+  }
   if (path === '/bootstrap' && method === 'GET') {
     const [settings, customers, catalogItems, rfqs, quotes, followUps] = await Promise.all([
       prisma.companySettings.findUnique({ where: { organizationId: organization.id } }),

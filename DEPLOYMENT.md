@@ -6,7 +6,7 @@ Use Node.js 22.13+ and PostgreSQL. Copy `.env.example` to `.env`, configure loca
 
 ## Netlify
 
-Set the build command to `npm run build`, publish directory to `dist`, and function directory to `netlify/functions` (also declared in `netlify.toml`). Configure `DATABASE_URL`, `DIRECT_URL`, `APP_URL` (HTTPS), and a strong `SESSION_SECRET`. Configure `AI_ENABLED`/`GEMINI_API_KEY` for Gemini and `EMAIL_PROVIDER=resend`, `EMAIL_API_KEY`, and `EMAIL_FROM` for transactional email. Store secrets in Netlify environment variables, never in source control.
+Set the build command to `npm run build`, publish directory to `dist`, and function directory to `netlify/functions` (also declared in `netlify.toml`). Configure `DATABASE_URL`, `DIRECT_URL`, and `APP_URL` (HTTPS). Sessions use cryptographically random bearer values stored as SHA-256 hashes, so there is no `SESSION_SECRET` setting. Configure `AI_ENABLED`/`GEMINI_API_KEY` for Gemini and `EMAIL_PROVIDER=resend`, `EMAIL_API_KEY`, and `EMAIL_FROM` for transactional email. Store secrets in Netlify environment variables, never in source control.
 
 Run `npm run db:migrate` against the production database as a release step before switching traffic. The Prisma runtime uses the pooled `DATABASE_URL`; migrations use `DIRECT_URL`. Back up the database and verify restore procedures before onboarding customers.
 

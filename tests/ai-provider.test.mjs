@@ -25,7 +25,9 @@ test('Gemini follow-up output is bounded to customer-safe fields', async () => {
 test('AI validators reject malformed data and configuration validates production essentials', () => {
   assert.throws(() => validateExtraction({ items: 'bad' }));
   assert.throws(() => validateFollowUp(null));
-  assert.throws(() => readConfig({ NODE_ENV: 'production', DATABASE_URL: 'postgresql://db', APP_URL: 'bad', SESSION_SECRET: 'short' }), /Production configuration is incomplete/);
+  assert.throws(() => readConfig({ NODE_ENV: 'production', DATABASE_URL: 'postgresql://db', APP_URL: 'bad' }), /Production configuration is incomplete/);
+  assert.throws(() => readConfig({ NODE_ENV: 'production', DATABASE_URL: 'postgresql://db', APP_URL: 'https://app.example', AI_ENABLED: 'true' }), /GEMINI_API_KEY/);
+  assert.throws(() => readConfig({ NODE_ENV: 'production', DATABASE_URL: 'postgresql://db', APP_URL: 'https://app.example', EMAIL_PROVIDER: 'resend' }), /EMAIL_API_KEY/);
   const config = readConfig({ AI_ENABLED: 'true', GEMINI_MODEL: 'test', GEMINI_API_KEY: 'secret' });
   assert.deepEqual({ enabled: config.ai.enabled, configured: config.ai.configured, model: config.ai.model }, { enabled: true, configured: true, model: 'test' });
 });

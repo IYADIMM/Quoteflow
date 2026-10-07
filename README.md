@@ -18,6 +18,7 @@ The command builds the static site, deploys Prisma migrations, and starts Netlif
 - Netlify modern function handler and static build that publishes only `dist/`.
 - PostgreSQL Prisma models and incremental migrations for tenants, users, sessions, customers, catalog, RFQs, quotes, follow-ups, AI usage, recovery/verification tokens and team invitations.
 - Organization-bound sessions, salted scrypt passwords, HttpOnly cookies, CSRF double-submit token/origin checks, same-tenant membership resolution, role checks, audit events, password recovery, and email verification paths.
+- Multi-organization membership support with a session-bound active organization, visible workspace switcher, server-side membership validation on every switch, and role re-derivation for the selected organization.
 - Tenant-scoped customer/catalog/RFQ/quote/follow-up/settings/bootstrap/team/analytics APIs.
 - Server-owned quote cost/tax from catalog items, fixed-point pricing, minimum-price and margin rules, quote numbering, draft version checks, send-state transitions and customer public-link outcomes based on snapshot data.
 - Team invitations with hashed single-use tokens, seven-day expiry, invited-email match, role restrictions, and email delivery.
@@ -27,7 +28,7 @@ The command builds the static site, deploys Prisma migrations, and starts Netlif
 
 ## Configuration
 
-Required for production: `DATABASE_URL` (pooled PostgreSQL URL), `DIRECT_URL` (direct/migration URL), `APP_URL` (public HTTPS origin), and a strong `SESSION_SECRET`. Configure `AI_ENABLED=true` and `GEMINI_API_KEY` to enable Gemini. Set `EMAIL_PROVIDER=resend`, `EMAIL_API_KEY`, and `EMAIL_FROM` for email delivery. Stripe keys are reserved configuration only; billing is not implemented.
+Required for production: `DATABASE_URL` (pooled PostgreSQL URL), `DIRECT_URL` (direct/migration URL), and `APP_URL` (public HTTPS origin). Sessions use cryptographically random bearer tokens stored as SHA-256 hashes; no `SESSION_SECRET` is used or required. Configure `AI_ENABLED=true` and `GEMINI_API_KEY` to enable Gemini. Set `EMAIL_PROVIDER=resend`, `EMAIL_API_KEY`, and `EMAIL_FROM` for email delivery. Billing is not implemented.
 
 Netlify build runs `npm run build`; publish directory is `dist`; function directory is `netlify/functions`. Apply database migrations with `npm run db:migrate` during release operations. Do not publish the repository root.
 

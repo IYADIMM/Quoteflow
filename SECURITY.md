@@ -5,6 +5,7 @@ The code includes production-oriented controls, but it has not had a full indepe
 ## Implemented controls
 
 - Scrypt password hashes with unique salts, random session tokens stored as hashes, tenant-bound session records, cookie expiry, HttpOnly/SameSite attributes, and Secure in production.
+- Users may have multiple memberships. The active organization is selected from server-validated memberships, stored on the session, and its role is derived again for each request. The workspace switcher never grants access based only on a browser-supplied organization ID.
 - Current membership validation and organization-scoped record queries; server role checks protect settings, catalog writes, team actions, and quote mutations.
 - Origin validation and a CSRF cookie/header pair for authenticated mutations; bounded API request bodies and input validation.
 - Hashed, expiring, single-use email verification/reset/invitation tokens; reset revokes active sessions; recovery responses avoid account enumeration.
