@@ -11,6 +11,7 @@ import { entitlementsFor } from '../../lib/entitlements.mjs';
 import { S3StorageProvider, storageKey, validateUpload } from '../../lib/storage-provider.mjs';
 import { generateQuotePdf } from '../../lib/pdf-provider.mjs';
 import { createRateLimiter } from '../../lib/rate-limit.mjs';
+import { createMonitor } from '../../lib/monitoring.mjs';
 
 export const config = { path: '/api/*' };
 const scrypt = promisify(scryptCallback);
@@ -22,6 +23,14 @@ const json = (statusCode, body, headers = {}) => {
   return { statusCode, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...singleHeaders }, ...(cookies ? { multiValueHeaders: { 'set-cookie': Array.isArray(cookies) ? cookies : [cookies] } } : {}), body: JSON.stringify(body) };
 };
 const binary = (statusCode, body, contentType, fileName) => ({ statusCode, isBase64Encoded: true, headers: { 'content-type': contentType, 'content-disposition': `attachment; filename="${String(fileName).replace(/[^a-zA-Z0-9_.-]/g, '_')}"`, 'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' }, body: body.toString('base64') });
+const requireVerifiedEmail = user => user?.emailVerifiedAt ? null : json(403, { error: 'Verify your email before performing this action.', code: 'EMAIL_VERIFICATION_REQUIRED' });
+async function passwordMatches(user, password) {
+  if (typeof password !== 'string' || password.length > 256) return false;
+  const [saltHex, expectedHex] = String(user?.passwordHash || '').split(':'), expected = Buffer.from(expectedHex || '', 'hex');
+  if (!saltHex || !expected.length) return false;
+  const actual = Buffer.from(await scrypt(password, Buffer.from(saltHex, 'hex'), 64));
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
 const ai = config => new GeminiProvider({ apiKey: config.ai.apiKey, model: config.ai.model });
 const titleStatus = value => ({ DRAFT: 'Draft', INTERNAL_REVIEW: 'Internal Review', SENDING: 'Sending', SENT: 'Sent', VIEWED: 'Viewed', ACCEPTED: 'Accepted', REJECTED: 'Rejected', EXPIRED: 'Expired', NEW: 'New', REVIEWING: 'Reviewing', PRICING: 'Pricing', QUOTED: 'Quoted', WON: 'Won', LOST: 'Lost', CANCELLED: 'Cancelled', PENDING: 'Pending', COMPLETED: 'Completed', SNOOZED: 'Snoozed' })[value] || value;
 const quoteDTO = quote => ({ ...quote, created: quote.issueDate?.toISOString().slice(0, 10), expiry: quote.expiryDate?.toISOString().slice(0, 10) || '', payment: quote.paymentTerms, delivery: quote.deliveryTerms, notes: quote.customerNotes, status: titleStatus(quote.status), discount: Number(quote.discount), items: (quote.items || []).map(line => ({ id: line.id, catalogItemId: line.catalogItemId, lineType: line.catalogItemId ? 'CATALOG' : 'MANUAL', name: line.nameSnapshot, sku: line.skuSnapshot, description: line.descriptionSnapshot, qty: Number(line.quantity), unit: line.unitSnapshot, cost: Number(line.costSnapshot), price: Number(line.sellingPrice), minimumPrice: line.minimumPriceSnapshot == null ? null : Number(line.minimumPriceSnapshot), tax: Number(line.taxRate) })) });
@@ -91,6 +100,7 @@ export function createHandler(dependencies = {}) {
   const makeStorage = dependencies.storageProvider || (config => new S3StorageProvider(config.storage));
   const makePdf = dependencies.pdfProvider || generateQuotePdf;
   const makeRateLimiter = dependencies.rateLimiter || createRateLimiter;
+  const makeMonitor = dependencies.monitor || createMonitor;
   return async function handler(event) {
   let config, prisma;
   try { config = loadConfig(); }
@@ -107,6 +117,18 @@ export function createHandler(dependencies = {}) {
   if (path !== '/stripe/webhook' && !csrf(event, config)) return json(403, { error: 'Request origin could not be verified.' });
   const body = (() => { try { return event.body ? JSON.parse(event.body) : {}; } catch { return null; } })();
   if (body === null && path !== '/stripe/webhook') return json(400, { error: 'Request body must be valid JSON.' });
+  const requestIp = event.headers['x-nf-client-connection-ip'] || event.headers['x-forwarded-for'] || 'unknown';
+  const throttle = async (scope, subject, limit, windowSeconds) => {
+    const limiter = makeRateLimiter(config); if (!limiter) return null;
+    try { const result = await limiter.consume(scope, subject, { limit, windowSeconds }); return result.allowed ? null : json(429, { error: 'Too many attempts. Try again later.' }, { 'retry-after': String(result.retryAfter) }); }
+    catch (error) { console.error('distributed_rate_limit_unavailable', { scope, message: error.message }); return config.production ? json(503, { error: 'Security rate limiting is temporarily unavailable.' }) : null; }
+  };
+
+  if (path === '/client-error' && method === 'POST') {
+    const limited = await throttle('client-error', requestIp, 10, 300); if (limited) return limited;
+    const monitor = makeMonitor(config); if (monitor) await monitor.capture({ event: 'frontend_exception', message: String(body.message || '').slice(0, 500), path: String(body.path || '').slice(0, 300), provider: 'browser' }).catch(() => {});
+    return json(202, { received: true });
+  }
 
   if (path === '/stripe/webhook' && method === 'POST') {
     if (!config.stripe.enabled) return json(404, { error: 'Billing webhook is disabled.' });
@@ -145,6 +167,7 @@ export function createHandler(dependencies = {}) {
 
   if (path === '/auth/signup' && method === 'POST') {
     const email = String(body.email || '').trim().toLowerCase(), password = body.password, organizationName = String(body.organization || '').trim();
+    const limited = await throttle('auth-signup', requestIp, 5, 3600); if (limited) return limited;
     const inviteToken = String(body.invitationToken || '').slice(0, 200);
     if (!/^\S+@\S+\.\S+$/.test(email) || typeof password !== 'string' || password.length < 12 || password.length > 256 || (!inviteToken && (organizationName.length < 2 || organizationName.length > 120))) return json(400, { error: 'Enter a valid email, a 12-character password and an organization name.' });
     const invitation = inviteToken ? await prisma.invitation.findUnique({ where: { tokenHash: sha256(inviteToken) }, include: { organization: true } }) : null;
@@ -182,6 +205,7 @@ export function createHandler(dependencies = {}) {
   }
   if (path === '/auth/login' && method === 'POST') {
     const email = String(body.email || '').trim().toLowerCase();
+    const ipLimited = await throttle('auth-login-ip', requestIp, 20, 900), identityLimited = await throttle('auth-login-identity', email || 'invalid', 10, 900); if (ipLimited || identityLimited) return ipLimited || identityLimited;
     const user = await prisma.user.findUnique({ where: { email }, include: { memberships: { include: { organization: true }, orderBy: { createdAt: 'asc' } } } });
     if (!user || typeof body.password !== 'string') return json(401, { error: 'Email or password is incorrect.' });
     const [saltHex, expectedHex] = user.passwordHash.split(':');
@@ -203,6 +227,7 @@ export function createHandler(dependencies = {}) {
 
   if (path === '/auth/verify-email' && method === 'POST') {
     const token = String(body.token || '').slice(0, 200);
+    const limited = await throttle('auth-verify', requestIp, 20, 900); if (limited) return limited;
     const found = await prisma.emailVerificationToken.findUnique({ where: { tokenHash: sha256(token) } });
     if (!found || found.usedAt || found.expiresAt <= new Date()) return json(400, { error: 'Verification link is invalid or expired.' });
     await prisma.$transaction(async tx => {
@@ -214,6 +239,7 @@ export function createHandler(dependencies = {}) {
 
   if (path === '/auth/recovery' && method === 'POST') {
     const email = String(body.email || '').trim().toLowerCase();
+    const ipLimited = await throttle('auth-recovery-ip', requestIp, 5, 3600), identityLimited = await throttle('auth-recovery-identity', email || 'invalid', 3, 3600); if (ipLimited || identityLimited) return ipLimited || identityLimited;
     const user = /^\S+@\S+\.\S+$/.test(email) ? await prisma.user.findUnique({ where: { email } }) : null;
     const emailProvider = makeEmail(config);
     if (user && emailProvider) {
@@ -227,6 +253,7 @@ export function createHandler(dependencies = {}) {
 
   if (path === '/auth/reset-password' && method === 'POST') {
     const token = String(body.token || '').slice(0, 200), password = body.password;
+    const limited = await throttle('auth-reset', requestIp, 10, 3600); if (limited) return limited;
     if (typeof password !== 'string' || password.length < 12 || password.length > 256) return json(400, { error: 'Password must be between 12 and 256 characters.' });
     const found = await prisma.passwordResetToken.findUnique({ where: { tokenHash: sha256(token) } });
     if (!found || found.usedAt || found.expiresAt <= new Date()) return json(400, { error: 'Recovery link is invalid or expired.' });
@@ -311,6 +338,16 @@ export function createHandler(dependencies = {}) {
   const principal = await authenticate(event, prisma);
   if (!principal) return json(401, { error: 'Authentication required.' });
   const { user, organization, role } = principal;
+  if (path === '/auth/resend-verification' && method === 'POST') {
+    if (user.emailVerifiedAt) return json(200, { verified: true });
+    const limited = await throttle('auth-verification-resend', `${requestIp}:${user.email}`, 3, 3600); if (limited) return limited;
+    const emailProvider = makeEmail(config); if (!emailProvider) return json(503, { error: 'Email delivery is not configured.' });
+    const token = randomBytes(32).toString('base64url'), expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+    await prisma.$transaction(async tx => { await tx.emailVerificationToken.updateMany({ where: { userId: user.id, usedAt: null }, data: { usedAt: new Date() } }); await tx.emailVerificationToken.create({ data: { userId: user.id, tokenHash: sha256(token), expiresAt } }); });
+    try { await emailProvider.send({ to: user.email, subject: 'Verify your QuoteFlow account', text: `Verify your email within one hour: ${config.appUrl}/verify-email?token=${encodeURIComponent(token)}` }); }
+    catch (error) { console.error('verification_resend_failed', { userId: user.id, message: error.message }); return json(502, { error: 'Verification email could not be sent. Try again later.' }); }
+    return json(200, { sent: true, expiresAt });
+  }
   if (path === '/billing' && method === 'GET') {
     const monthStart = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1));
     const [subscription, teamMembers, quotesThisMonth, aiRequestsThisMonth, storage, deletionRequest] = await Promise.all([
@@ -322,6 +359,7 @@ export function createHandler(dependencies = {}) {
     return json(200, { subscription, entitlements: entitlementsFor(subscription, { teamMembers, quotesThisMonth, aiRequestsThisMonth, storageBytes: storage._sum.byteSize || 0 }), billingEnabled: config.stripe.enabled, deletionRequest });
   }
   if (path === '/billing/checkout' && method === 'POST') {
+    const verification = requireVerifiedEmail(user); if (verification) return verification;
     if (!['OWNER', 'ADMIN'].includes(role)) return json(403, { error: 'Only an Owner or Admin may manage billing.' });
     if (!config.stripe.enabled) return json(503, { error: 'Billing is not configured for this deployment.' });
     const plan = String(body.plan || '').toUpperCase(); if (!['PRO', 'BUSINESS'].includes(plan)) return json(400, { error: 'Choose the Pro or Business plan.' });
@@ -333,6 +371,7 @@ export function createHandler(dependencies = {}) {
     return json(200, { url: session.url });
   }
   if (path === '/billing/portal' && method === 'POST') {
+    const verification = requireVerifiedEmail(user); if (verification) return verification;
     if (!['OWNER', 'ADMIN'].includes(role)) return json(403, { error: 'Only an Owner or Admin may manage billing.' });
     if (!config.stripe.enabled) return json(503, { error: 'Billing is not configured for this deployment.' });
     const subscription = await prisma.subscription.findUnique({ where: { organizationId: organization.id } });
@@ -351,12 +390,13 @@ export function createHandler(dependencies = {}) {
     return json(200, { exportedAt: new Date().toISOString(), organization, settings, members: members.map(m => ({ email: m.user.email, role: m.role, createdAt: m.createdAt })), customers, catalogItems, rfqs, quotes, followUps, auditLogs, attachments, subscription });
   }
   if (path === '/account/deletion-request' && method === 'POST') {
+    const verification = requireVerifiedEmail(user); if (verification) return verification;
     if (role !== 'OWNER') return json(403, { error: 'Only the organization Owner may request deletion.' });
     const scheduledFor = new Date(Date.now() + 7 * 864e5), pending = await prisma.organizationDeletionRequest.findFirst({ where: { organizationId: organization.id, canceledAt: null, completedAt: null } });
     if (pending) return json(200, { request: pending, duplicate: true });
     const request = await prisma.organizationDeletionRequest.create({ data: { organizationId: organization.id, requestedById: user.id, scheduledFor } });
     await prisma.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'organization.deletion_requested', objectType: 'Organization', objectId: organization.id, metadata: { scheduledFor: scheduledFor.toISOString() } } });
-    return json(202, { request, message: 'Deletion is scheduled after a seven-day cooling-off period. Export your data before the scheduled date.' });
+    return json(202, { request, message: 'Deletion requested — scheduled for operator processing after the seven-day cooling-off period. Export your data before that date.' });
   }
   if (path === '/account/deletion-request' && method === 'DELETE') {
     if (role !== 'OWNER') return json(403, { error: 'Only the organization Owner may cancel deletion.' });
@@ -394,7 +434,7 @@ export function createHandler(dependencies = {}) {
   }
   if (path === '/auth/me' && method === 'GET') {
     const memberships = await prisma.membership.findMany({ where: { userId: user.id }, include: { organization: { select: { id: true, name: true, reportingCurrency: true } } }, orderBy: { createdAt: 'asc' } });
-    return json(200, { user: { id: user.id, email: user.email }, organization: { id: organization.id, name: organization.name, currency: organization.reportingCurrency }, role, memberships: memberships.map(m => ({ organizationId: m.organizationId, name: m.organization.name, role: m.role })) });
+    return json(200, { user: { id: user.id, email: user.email, emailVerifiedAt: user.emailVerifiedAt, verified: Boolean(user.emailVerifiedAt) }, organization: { id: organization.id, name: organization.name, currency: organization.reportingCurrency }, role, memberships: memberships.map(m => ({ organizationId: m.organizationId, name: m.organization.name, role: m.role })) });
   }
   if (path === '/auth/switch-organization' && method === 'POST') {
     const organizationId = String(body.organizationId || '').trim();
@@ -407,12 +447,10 @@ export function createHandler(dependencies = {}) {
     return json(200, { organization: { id: membership.organization.id, name: membership.organization.name, currency: membership.organization.reportingCurrency }, role: membership.role });
   }
   if (path === '/auth/change-password' && method === 'POST') {
+    const limited = await throttle('auth-change-password', `${requestIp}:${user.id}`, 5, 900); if (limited) return limited;
     const currentPassword = body.currentPassword, nextPassword = body.newPassword;
     if (typeof currentPassword !== 'string' || typeof nextPassword !== 'string' || nextPassword.length < 12 || nextPassword.length > 256 || currentPassword === nextPassword) return json(400, { error: 'Enter your current password and a different new password of 12–256 characters.' });
-    const [saltHex, expectedHex] = user.passwordHash.split(':'), expected = Buffer.from(expectedHex || '', 'hex');
-    if (!saltHex || !expected.length) return json(409, { error: 'This account password cannot be changed through this method.' });
-    const actual = Buffer.from(await scrypt(currentPassword, Buffer.from(saltHex, 'hex'), 64));
-    if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return json(401, { error: 'Current password is incorrect.' });
+    if (!await passwordMatches(user, currentPassword)) return json(401, { error: 'Current password is incorrect.' });
     const salt = randomBytes(16), passwordHash = `${salt.toString('hex')}:${Buffer.from(await scrypt(nextPassword, salt, 64)).toString('hex')}`;
     await prisma.$transaction(async tx => { await tx.user.update({ where: { id: user.id }, data: { passwordHash } }); await tx.session.deleteMany({ where: { userId: user.id, id: { not: principal.session.id } } }); await tx.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'auth.password_changed', objectType: 'User', objectId: user.id } }); });
     return json(200, { changed: true, otherSessionsRevoked: true });
@@ -421,6 +459,25 @@ export function createHandler(dependencies = {}) {
     const removed = await prisma.session.deleteMany({ where: { userId: user.id, id: { not: principal.session.id } } });
     await prisma.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'auth.other_sessions_revoked', objectType: 'User', objectId: user.id, metadata: { count: removed.count } } });
     return json(200, { revoked: removed.count });
+  }
+  if (path === '/account' && method === 'DELETE') {
+    const verification = requireVerifiedEmail(user); if (verification) return verification;
+    const limited = await throttle('account-delete', `${requestIp}:${user.id}`, 3, 3600); if (limited) return limited;
+    if (body.confirm !== 'DELETE MY ACCOUNT') return json(400, { error: 'Enter the account deletion confirmation exactly.' });
+    if (!await passwordMatches(user, body.currentPassword)) return json(401, { error: 'Current password is incorrect.' });
+    const owned = await prisma.membership.findMany({ where: { userId: user.id, role: 'OWNER' }, select: { organizationId: true } });
+    for (const membership of owned) {
+      const otherOwners = await prisma.membership.count({ where: { organizationId: membership.organizationId, role: 'OWNER', userId: { not: user.id } } });
+      if (!otherOwners) return json(409, { error: 'Transfer ownership or request deletion for every organization you solely own before deleting your account.' });
+    }
+    const affected = await prisma.membership.findMany({ where: { userId: user.id }, select: { organizationId: true, role: true } });
+    await prisma.$transaction(async tx => {
+      for (const membership of affected) await tx.auditLog.create({ data: { organizationId: membership.organizationId, actorUserId: user.id, action: 'account.deletion_requested', objectType: 'User', objectId: user.id, metadata: { previousRole: membership.role } } });
+      await tx.session.deleteMany({ where: { userId: user.id } });
+      await tx.user.delete({ where: { id: user.id } });
+    });
+    const secure = config.production ? '; Secure' : '';
+    return json(200, { deleted: true }, { 'set-cookie': [`qf_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secure}`, `qf_csrf=; SameSite=Lax; Path=/; Max-Age=0${secure}`] });
   }
     if (path === '/bootstrap' && method === 'GET') {
     const [settings, customers, catalogItems, rfqs, quotes, followUps, events] = await Promise.all([
@@ -520,6 +577,7 @@ export function createHandler(dependencies = {}) {
     return json(201, { item: { ...item, title: item.task, due: item.dueAt.toISOString().slice(0, 10), status: 'Pending' } });
   }
   if (path === '/settings' && method === 'PUT') {
+    const verification = requireVerifiedEmail(user); if (verification) return verification;
     if (!['OWNER', 'ADMIN'].includes(role)) return json(403, { error: 'Only an Owner or Admin may update settings.' });
     const company = String(body.company || organization.name).trim().slice(0, 120);
     const minMargin = Number(body.margin ?? 20);
@@ -552,10 +610,12 @@ export function createHandler(dependencies = {}) {
     return json(200, { members: members.map(member => ({ userId: member.userId, email: member.user.email, role: member.role, createdAt: member.createdAt })) });
   }
   if (path === '/team/invite' && method === 'POST') {
+    const verification = requireVerifiedEmail(user); if (verification) return verification;
+    const limited = await throttle('team-invite', `${requestIp}:${organization.id}`, 10, 3600); if (limited) return limited;
     if (!['OWNER', 'ADMIN', 'SALES_MANAGER'].includes(role)) return json(403, { error: 'Team access is not permitted.' });
     const email = String(body.email || '').trim().toLowerCase();
     const requestedRole = String(body.role || 'SALES_REP').toUpperCase();
-    if (!/^\\S+@\\S+\\.\\S+$/.test(email) || email.length > 254) return json(400, { error: 'Enter a valid email address.' });
+    if (!/^\S+@\S+\.\S+$/.test(email) || email.length > 254) return json(400, { error: 'Enter a valid email address.' });
     if (!['ADMIN', 'SALES_MANAGER', 'SALES_REP', 'VIEWER'].includes(requestedRole)) return json(400, { error: 'Choose an assignable team role.' });
     if (requestedRole === 'ADMIN' && role !== 'OWNER') return json(403, { error: 'Only an Owner may invite an Admin.' });
     const [subscription, memberCount] = await Promise.all([prisma.subscription.findUnique({ where: { organizationId: organization.id } }), prisma.membership.count({ where: { organizationId: organization.id } })]);
@@ -578,6 +638,7 @@ export function createHandler(dependencies = {}) {
     return json(201, { invitation: { email, role: requestedRole, expiresAt: invitation.expiresAt } });
   }
   if (path === '/team/accept' && method === 'POST') {
+    const limited = await throttle('team-invitation-accept', requestIp, 20, 3600); if (limited) return limited;
     const token = String(body.token || '').slice(0, 200);
     const invitation = await prisma.invitation.findUnique({ where: { tokenHash: sha256(token) }, include: { organization: true } });
     if (!invitation || invitation.acceptedAt || invitation.expiresAt <= new Date()) return json(400, { error: 'Invitation is invalid, expired or already accepted.' });
@@ -597,6 +658,30 @@ export function createHandler(dependencies = {}) {
       throw error;
     }
     return json(200, { organization: { id: invitation.organization.id, name: invitation.organization.name }, role: invitation.role });
+  }
+  if (path === '/team/transfer-ownership' && method === 'POST') {
+    const verification = requireVerifiedEmail(user); if (verification) return verification;
+    const limited = await throttle('team-ownership-transfer', `${requestIp}:${organization.id}`, 5, 3600); if (limited) return limited;
+    if (role !== 'OWNER') return json(403, { error: 'Only the current Owner may transfer ownership.' });
+    const targetUserId = String(body.targetUserId || '').trim();
+    if (!targetUserId || targetUserId === user.id || body.confirm !== 'TRANSFER') return json(400, { error: 'Choose another current team member and enter the transfer confirmation.' });
+    if (!await passwordMatches(user, body.currentPassword)) return json(401, { error: 'Current password is incorrect.' });
+    const target = await prisma.membership.findUnique({ where: { userId_organizationId: { userId: targetUserId, organizationId: organization.id } } });
+    if (!target) return json(404, { error: 'The new Owner must already belong to this organization.' });
+    if (target.role === 'OWNER') return json(409, { error: 'That team member is already the Owner.' });
+    try {
+      await prisma.$transaction(async tx => {
+        const current = await tx.membership.updateMany({ where: { userId: user.id, organizationId: organization.id, role: 'OWNER' }, data: { role: 'ADMIN' } });
+        if (current.count !== 1) throw new Error('OWNERSHIP_CHANGED');
+        await tx.membership.update({ where: { userId_organizationId: { userId: targetUserId, organizationId: organization.id } }, data: { role: 'OWNER' } });
+        await tx.session.deleteMany({ where: { organizationId: organization.id, userId: { in: [user.id, targetUserId] }, id: { not: principal.session.id } } });
+        await tx.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'organization.ownership_transferred', objectType: 'User', objectId: targetUserId, metadata: { previousOwnerUserId: user.id, previousTargetRole: target.role } } });
+      });
+    } catch (error) {
+      if (error.message === 'OWNERSHIP_CHANGED') return json(409, { error: 'Organization ownership changed. Refresh and try again.' });
+      throw error;
+    }
+    return json(200, { transferred: true, ownerUserId: targetUserId, previousOwnerRole: 'ADMIN' });
   }
   const memberMatch = /^\/team\/([^/]+)$/.exec(path);
   if (memberMatch && ['PATCH', 'DELETE'].includes(method)) {
@@ -726,6 +811,7 @@ export function createHandler(dependencies = {}) {
   }
   const sendMatch = /^\/quotes\/([^/]+)\/send$/.exec(path);
   if (sendMatch && method === 'POST') {
+    const verification = requireVerifiedEmail(user); if (verification) return verification;
     if (!['OWNER', 'ADMIN', 'SALES_MANAGER', 'SALES_REP'].includes(role)) return json(403, { error: 'Read-only role.' });
     const quote = await prisma.quote.findFirst({ where: { id: sendMatch[1], organizationId: organization.id, deletedAt: null }, include: { customer: true, items: { orderBy: { sortOrder: 'asc' } }, organization: { include: { settings: true } } } });
     if (!quote) return json(404, { error: 'Quote not found.' });
@@ -757,7 +843,8 @@ export function createHandler(dependencies = {}) {
     // The raw bearer token exists only in this invocation and the outbound message.
     const reserved = await prisma.quote.updateMany({ where: { id: quote.id, organizationId: organization.id, status: quote.status, version: quote.version }, data: { status: 'SENDING', sendAttemptKey: effectiveRequestKey, sendAttemptState: 'SENDING', sendAttemptAt: new Date(), snapshot, publicTokenHash: sha256(token), publicTokenExpiresAt: expiryAt } });
     if (!reserved.count) return json(409, { error: 'The quote changed while delivery was being prepared.' });
-    try { await emailProvider.send({ to: quote.customer.email, subject: `Quotation ${quote.number} — ${quote.title}`, text: `Your quotation ${quote.number} is ready. View it securely: ${url}\n\nThis link expires ${expiryAt.toISOString().slice(0, 10)}.` }); }
+    let delivery;
+    try { delivery = await emailProvider.send({ to: quote.customer.email, subject: `Quotation ${quote.number} — ${quote.title}`, text: `Your quotation ${quote.number} is ready. View it securely: ${url}\n\nThis link expires ${expiryAt.toISOString().slice(0, 10)}.` }); }
     catch (error) {
       const ambiguous = Boolean(error?.ambiguous || error?.name === 'AbortError' || error?.code === 'ETIMEDOUT');
       await prisma.quote.updateMany({ where: { id: quote.id, organizationId: organization.id, status: 'SENDING', sendAttemptKey: effectiveRequestKey }, data: ambiguous ? { sendAttemptState: 'AMBIGUOUS' } : { status: quote.status, sendAttemptState: 'FAILED', snapshot: quote.snapshot, publicTokenHash: null, publicTokenExpiresAt: null } }).catch(() => {});
@@ -767,7 +854,7 @@ export function createHandler(dependencies = {}) {
     const changed = await prisma.$transaction(async tx => {
       const result = await tx.quote.updateMany({ where: { id: quote.id, organizationId: organization.id, status: 'SENDING', sendAttemptKey: effectiveRequestKey }, data: { status: 'SENT', sendAttemptState: 'SENT', sentAt: new Date() } });
       if (!result.count) throw new Error('Quote state changed during delivery.');
-      await tx.quoteEvent.create({ data: { quoteId: quote.id, type: 'SENT', actorUserId: user.id } });
+      await tx.quoteEvent.create({ data: { quoteId: quote.id, type: 'SENT', actorUserId: user.id, metadata: delivery?.id ? { providerMessageId: String(delivery.id).slice(0, 200) } : undefined } });
       return result.count;
     }).catch(() => 0);
     if (!changed) {
@@ -909,10 +996,18 @@ export default async function netlifyHandler(request, context) {
     body = await request.text();
     if (body.length > 1_000_000) return new Response(JSON.stringify({ error: 'Request body is too large.' }), { status: 413, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
   }
-  const result = await legacyEventAdapter({ path: url.pathname, httpMethod: request.method, headers, body });
+  let monitor = null, result;
+  try { monitor = createMonitor(readConfig()); } catch {}
+  try { result = await legacyEventAdapter({ path: url.pathname, httpMethod: request.method, headers, body }); }
+  catch (error) {
+    console.error('unhandled_api_error', { requestId, method: request.method, path: url.pathname, message: error.message });
+    if (monitor) await monitor.capture({ event: 'unhandled_api_error', message: error.message, requestId, method: request.method, path: url.pathname, status: 500 }).catch(() => {});
+    result = json(500, { error: 'An unexpected server error occurred.', requestId });
+  }
   const responseHeaders = new Headers(result.headers || {});
   responseHeaders.set('x-request-id', requestId);
   for (const cookie of result.multiValueHeaders?.['set-cookie'] || []) responseHeaders.append('set-cookie', cookie);
   console.log(JSON.stringify({ level: 'info', event: 'request_completed', requestId, method: request.method, path: url.pathname, status: result.statusCode || 200, durationMs: Date.now() - startedAt }));
+  if (monitor && (result.statusCode || 200) >= 500) await monitor.capture({ event: 'api_failure', message: 'API request failed', requestId, method: request.method, path: url.pathname, status: result.statusCode || 500 }).catch(() => {});
   return new Response(result.isBase64Encoded ? Buffer.from(result.body || '', 'base64') : result.body || '', { status: result.statusCode || 200, headers: responseHeaders });
 }

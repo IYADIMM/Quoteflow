@@ -25,7 +25,7 @@ Create an empty database whose name contains `restore`, `drill`, `staging`, or `
 .\scripts\restore-drill.ps1 -BackupFile D:\secure-backups\quoteflow\quoteflow-YYYYMMDDTHHMMSSZ.dump -TargetDatabaseUrl $env:RESTORE_DATABASE_URL
 ```
 
-The script refuses an ordinary production-looking target name, restores with `--clean --if-exists`, and verifies core table readability and row counts. After it passes, run `npm run release:check` with `DATABASE_URL` pointed at the restored database and perform the customer portal smoke path.
+The script refuses an ordinary production-looking target name, restores with `--clean --if-exists`, and verifies table readability and row counts for users, organizations, memberships, customers, catalog, RFQs/items, quotes/items/approvals/acceptances/events, follow-ups, subscriptions, attachments, and audit logs. After it passes, point `DATABASE_URL` at the restored database, run `pnpm run db:qualify` and `pnpm run release:check`, then perform the customer portal smoke path.
 
 ## Recovery decision
 

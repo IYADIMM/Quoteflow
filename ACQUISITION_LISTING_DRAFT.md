@@ -2,7 +2,7 @@
 
 ## QuoteFlow — RFQ and commercial quotation SaaS release candidate
 
-QuoteFlow helps B2B supplier teams turn incoming RFQs into controlled, customer-ready quotations. The product combines RFQ capture and AI-assisted extraction with catalog/manual pricing, margin and minimum-price controls, manager approval, immutable revisions, PDF generation, secure customer links, accept/reject/question workflows, follow-ups and analytics.
+QuoteFlow helps B2B supplier teams manually record incoming RFQs and turn them into controlled, customer-ready quotations. The product combines manual RFQ capture and user-triggered extraction of pasted text with catalog/manual pricing, margin and minimum-price controls, manager approval, immutable revisions, PDF generation, secure customer links, accept/reject/question workflows, follow-ups and analytics. Automatic mailbox ingestion and attachment OCR are not included.
 
 The transferable asset includes the responsive web application, PostgreSQL/Prisma data model and migrations, Netlify serverless API, organization roles and tenancy, Stripe-hosted subscriptions, Gemini and Resend adapters, private object-storage integration, fictional demo, automated tests, deployment/operations documentation and an acquisition handover package.
 

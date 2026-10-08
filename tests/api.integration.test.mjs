@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes, scryptSync } from 'node:crypto';
 import { createHandler, reserveAIUsage } from '../netlify/functions/api.mjs';
 
 const config = { production: false, appUrl: 'https://quoteflow.test', databaseUrl: 'postgres://test', ai: { enabled: true, configured: true, apiKey: 'test-only', model: 'gemini-test', maxRequestsPerMinute: 5, maxInputChars: 2000, monthlyLimits: { FREE: 25, PRO: 500, BUSINESS: 5000 } }, email: { provider: '', apiKey: '', from: '' } };
@@ -147,7 +147,7 @@ test('a same-key retry after send finalization is idempotent without persisting 
   const sessionToken = 'send-session', requestKey = 'retry-key-123';
   const quote = { id: 'quote-1', organizationId: 'org-1', status: 'SENT', version: 7, sendAttemptKey: requestKey, sendAttemptState: 'SENT', snapshot: { publicUrl: 'https://quoteflow.test/q/issued' }, deletedAt: null };
   const prisma = {
-    session: { findUnique: async () => ({ id: 'session-1', userId: 'user-1', organizationId: 'org-1', expiresAt: new Date(Date.now() + 60_000), user: { id: 'user-1' }, organization: { id: 'org-1', reportingCurrency: 'AED' } }) },
+    session: { findUnique: async () => ({ id: 'session-1', userId: 'user-1', organizationId: 'org-1', expiresAt: new Date(Date.now() + 60_000), user: { id: 'user-1', emailVerifiedAt: new Date() }, organization: { id: 'org-1', reportingCurrency: 'AED' } }) },
     membership: { findUnique: async () => ({ role: 'SALES_REP' }) },
     quote: { findFirst: async () => quote }
   };
@@ -164,7 +164,7 @@ test('billing checkout is server-authorized and uses the active session organiza
   const sessionToken = 'billing-session';
   const billingConfig = { ...config, stripe: { enabled: true, secretKey: 'sk_test', webhookSecret: 'whsec_test', prices: { PRO: 'price_pro', BUSINESS: 'price_business' } }, storage: { enabled: false }, pdf: {} };
   const makePrisma = role => ({
-    session: { findUnique: async () => ({ id: 'session-1', userId: 'user-1', organizationId: 'org-a', expiresAt: new Date(Date.now() + 60_000), user: { id: 'user-1', email: 'owner@example.test' }, organization: { id: 'org-a', name: 'Alpha', reportingCurrency: 'AED' } }) },
+    session: { findUnique: async () => ({ id: 'session-1', userId: 'user-1', organizationId: 'org-a', expiresAt: new Date(Date.now() + 60_000), user: { id: 'user-1', email: 'owner@example.test', emailVerifiedAt: new Date() }, organization: { id: 'org-a', name: 'Alpha', reportingCurrency: 'AED' } }) },
     membership: { findUnique: async () => ({ role }) },
     subscription: { findUnique: async () => ({ id: 'sub-row', organizationId: 'org-a', stripeCustomerId: 'cus_1' }) },
     auditLog: { create: async ({ data }) => { assert.equal(data.organizationId, 'org-a'); } }
@@ -218,4 +218,99 @@ test('team mutations are tenant scoped and preserve organization ownership', asy
   assert.equal((await call('rep')).statusCode, 200);
   assert.equal(members.rep, undefined);
   assert.equal(removed.organizationId, 'org-1');
+});
+
+test('distributed authentication limits return 429 without revealing account existence', async () => {
+  const scopes = [];
+  const prisma = { user: { findUnique: async () => { throw new Error('identity lookup must not run after rate limit'); } } };
+  const handler = createHandler({ readConfig: () => config, getPrisma: async () => prisma, rateLimiter: () => ({ consume: async scope => { scopes.push(scope); return { allowed: false, retryAfter: 321 }; } }) });
+  for (const [path, body] of [
+    ['/api/auth/signup', { email: 'new@example.test', password: 'long-enough-password', organization: 'Example' }],
+    ['/api/auth/login', { email: 'person@example.test', password: 'wrong-password-value' }],
+    ['/api/auth/recovery', { email: 'person@example.test' }]
+  ]) {
+    const result = await handler({ path, httpMethod: 'POST', headers: { origin: config.appUrl, 'x-forwarded-for': '203.0.113.8' }, body: JSON.stringify(body) });
+    assert.equal(result.statusCode, 429);
+    assert.equal(result.headers['retry-after'], '321');
+    assert.equal(JSON.parse(result.body).error.includes('account'), false);
+  }
+  assert.ok(scopes.includes('auth-signup'));
+  assert.ok(scopes.includes('auth-login-ip'));
+  assert.ok(scopes.includes('auth-recovery-ip'));
+});
+
+test('unverified users are blocked from commercial and sensitive operations', async () => {
+  const token = 'unverified-session';
+  const prisma = {
+    session: { findUnique: async () => ({ id: 'session-1', userId: 'user-1', organizationId: 'org-1', expiresAt: new Date(Date.now() + 60_000), user: { id: 'user-1', email: 'owner@example.test', emailVerifiedAt: null }, organization: { id: 'org-1', name: 'Example', reportingCurrency: 'AED' } }) },
+    membership: { findUnique: async () => ({ role: 'OWNER' }) }
+  };
+  const handler = createHandler({ readConfig: () => ({ ...config, stripe: { enabled: true } }), getPrisma: async () => prisma });
+  const headers = { cookie: `qf_session=${token}; qf_csrf=csrf`, 'x-csrf-token': 'csrf', origin: config.appUrl };
+  for (const [path, body] of [['/api/billing/checkout', { plan: 'PRO' }], ['/api/team/invite', { email: 'rep@example.test', role: 'SALES_REP' }], ['/api/settings', { company: 'Example' }], ['/api/account/deletion-request', {}]]) {
+    const result = await handler({ path, httpMethod: path === '/api/settings' ? 'PUT' : 'POST', headers, body: JSON.stringify(body) });
+    assert.equal(result.statusCode, 403);
+    assert.equal(JSON.parse(result.body).code, 'EMAIL_VERIFICATION_REQUIRED');
+  }
+});
+
+test('verification resend rotates prior tokens and never exposes the bearer token', async () => {
+  const token = 'resend-session'; let invalidated = false, created, delivered;
+  const tx = {
+    emailVerificationToken: {
+      updateMany: async () => { invalidated = true; return { count: 1 }; },
+      create: async ({ data }) => { created = data; return { id: 'verification-2', ...data }; }
+    }
+  };
+  const prisma = {
+    session: { findUnique: async () => ({ id: 'session-1', userId: 'user-1', organizationId: 'org-1', expiresAt: new Date(Date.now() + 60_000), user: { id: 'user-1', email: 'owner@example.test', emailVerifiedAt: null }, organization: { id: 'org-1', name: 'Example', reportingCurrency: 'AED' } }) },
+    membership: { findUnique: async () => ({ role: 'OWNER' }) },
+    $transaction: async fn => fn(tx)
+  };
+  const handler = createHandler({ readConfig: () => config, getPrisma: async () => prisma, emailProvider: () => ({ send: async message => { delivered = message; return { id: 'email-1' }; } }) });
+  const result = await handler({ path: '/api/auth/resend-verification', httpMethod: 'POST', headers: { cookie: `qf_session=${token}; qf_csrf=csrf`, 'x-csrf-token': 'csrf', origin: config.appUrl }, body: '{}' });
+  assert.equal(result.statusCode, 200);
+  assert.equal(invalidated, true);
+  assert.match(created.tokenHash, /^[a-f0-9]{64}$/);
+  assert.match(delivered.text, /verify-email\?token=/);
+  assert.equal(result.body.includes('token'), false);
+});
+
+test('ownership transfer requires the current owner password and an in-tenant target', async () => {
+  const sessionToken = 'owner-session', password = 'correct-horse-battery-staple', salt = randomBytes(16);
+  const passwordHash = `${salt.toString('hex')}:${scryptSync(password, salt, 64).toString('hex')}`;
+  const memberships = { owner: { userId: 'owner', organizationId: 'org-1', role: 'OWNER' }, manager: { userId: 'manager', organizationId: 'org-1', role: 'SALES_MANAGER' } };
+  let audit;
+  const prisma = {
+    session: { findUnique: async () => ({ id: 'session-1', userId: 'owner', organizationId: 'org-1', expiresAt: new Date(Date.now() + 60_000), user: { id: 'owner', email: 'owner@example.test', emailVerifiedAt: new Date(), passwordHash }, organization: { id: 'org-1', name: 'Example', reportingCurrency: 'AED' } }), deleteMany: async () => ({ count: 0 }) },
+    membership: {
+      findUnique: async ({ where }) => memberships[where.userId_organizationId.userId] || null,
+      updateMany: async ({ where, data }) => { if (memberships.owner.role !== where.role) return { count: 0 }; memberships.owner.role = data.role; return { count: 1 }; },
+      update: async ({ where, data }) => { const row = memberships[where.userId_organizationId.userId]; row.role = data.role; return row; }
+    },
+    auditLog: { create: async ({ data }) => { audit = data; return data; } },
+    $transaction: async fn => fn(prisma)
+  };
+  const handler = createHandler({ readConfig: () => config, getPrisma: async () => prisma });
+  const call = body => handler({ path: '/api/team/transfer-ownership', httpMethod: 'POST', headers: { cookie: `qf_session=${sessionToken}; qf_csrf=csrf`, 'x-csrf-token': 'csrf', origin: config.appUrl }, body: JSON.stringify(body) });
+  assert.equal((await call({ targetUserId: 'outside', currentPassword: password, confirm: 'TRANSFER' })).statusCode, 404);
+  assert.equal((await call({ targetUserId: 'manager', currentPassword: 'wrong', confirm: 'TRANSFER' })).statusCode, 401);
+  const result = await call({ targetUserId: 'manager', currentPassword: password, confirm: 'TRANSFER' });
+  assert.equal(result.statusCode, 200);
+  assert.equal(memberships.owner.role, 'ADMIN');
+  assert.equal(memberships.manager.role, 'OWNER');
+  assert.equal(audit.action, 'organization.ownership_transferred');
+});
+
+test('account deletion refuses a sole organization owner', async () => {
+  const sessionToken = 'delete-session', password = 'correct-horse-battery-staple', salt = randomBytes(16);
+  const passwordHash = `${salt.toString('hex')}:${scryptSync(password, salt, 64).toString('hex')}`;
+  const prisma = {
+    session: { findUnique: async () => ({ id: 'session-1', userId: 'owner', organizationId: 'org-1', expiresAt: new Date(Date.now() + 60_000), user: { id: 'owner', emailVerifiedAt: new Date(), passwordHash }, organization: { id: 'org-1', reportingCurrency: 'AED' } }) },
+    membership: { findUnique: async () => ({ role: 'OWNER' }), findMany: async () => [{ organizationId: 'org-1', role: 'OWNER' }], count: async () => 0 }
+  };
+  const handler = createHandler({ readConfig: () => config, getPrisma: async () => prisma });
+  const result = await handler({ path: '/api/account', httpMethod: 'DELETE', headers: { cookie: `qf_session=${sessionToken}; qf_csrf=csrf`, 'x-csrf-token': 'csrf', origin: config.appUrl }, body: JSON.stringify({ currentPassword: password, confirm: 'DELETE MY ACCOUNT' }) });
+  assert.equal(result.statusCode, 409);
+  assert.match(JSON.parse(result.body).error, /Transfer ownership/);
 });

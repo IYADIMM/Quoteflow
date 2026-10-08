@@ -3,9 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.13" },
+  "packageManager": "pnpm@11.25.0",
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
-    "dev": "npm run build && prisma migrate deploy && netlify dev",
+    "dev": "pnpm run build && prisma migrate deploy && netlify dev",
     "start": "netlify dev",
     "build": "prisma generate && node scripts/build.mjs",
     "test": "node --test tests/*.test.mjs",
@@ -14,6 +17,7 @@
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate deploy",
     "db:validate": "prisma validate",
+    "db:qualify": "node scripts/qualify-database.mjs",
     "db:dev": "prisma migrate dev",
     "release:check": "node scripts/release-check.mjs",
     "licenses": "node scripts/license-inventory.mjs"
@@ -30,7 +34,7 @@
     "stripe": "^18.5.0"
   },
   "devDependencies": {
-    "netlify-cli": "^23.5.0",
+    "netlify-cli": "^27.11.2",
     "prisma": "^7.0.0"
   }
 }

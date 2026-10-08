@@ -3,16 +3,16 @@
 ## Before staging
 
 - [ ] Review schema/migration; create pre-migration backup.
-- [ ] Run `npm ci` (or the organization’s locked installer).
-- [ ] Run `npm run release:check` and confirm exact test count.
+- [ ] Run `pnpm install --frozen-lockfile` with pnpm 11.25.0.
+- [ ] Run `pnpm run release:check` and confirm exact test count.
 - [ ] Scan dependencies and secrets; review `DEPENDENCY_LICENSE_INVENTORY.md`.
 - [ ] Confirm `.env` is ignored and no credentials are in source or build output.
 - [ ] Review negative search results for TODO/FIXME/mock/demo/localhost/console output.
 
 ## Staging
 
-- [ ] Run `npm run db:migrate` with the staging direct URL.
-- [ ] Deploy and complete `PRODUCTION_SMOKE_TEST.md`.
+- [ ] Run `pnpm run db:migrate` with the staging direct URL, then `pnpm run db:qualify` against that isolated database.
+- [ ] Deploy and complete `STAGING_QUALIFICATION.md` and `PRODUCTION_SMOKE_TEST.md`.
 - [ ] Verify Stripe signature/replay, Resend delivery, Gemini fallback, storage MIME rejection, PDF contents, Upstash throttling and request IDs.
 - [ ] Complete an isolated database restore drill.
 - [ ] Check mobile, keyboard, screen-reader names, focus order and 100-line quote PDF.

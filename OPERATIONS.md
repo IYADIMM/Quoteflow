@@ -12,7 +12,7 @@ Every API response carries `x-request-id`; function completion logs are JSON wit
 
 ## Alerts
 
-Create alerts for: health failure for five minutes, 5xx rate over 2%, repeated database connection errors, Stripe webhook retry/failure, email provider failure, storage verification failure, backup age over 26 hours, and unusual public-question throttling.
+Create alerts for: health failure for five minutes, 5xx rate over 2%, repeated database connection errors, Stripe webhook retry/failure, Resend failure, Gemini failure, storage verification failure, repeated login throttling, backup job failure or age over 26 hours, and unusual public-question throttling. Route critical alerts to a named primary and backup operator and test each route in staging.
 
 ## Provider failure behavior
 
@@ -21,6 +21,7 @@ Create alerts for: health failure for five minutes, 5xx rate over 2%, repeated d
 - Stripe: existing database entitlements continue until webhook state changes. Reconcile missed events in Stripe before manual database action.
 - Storage: attachments/PDF archival fail explicitly; quote PDF download still works when generation succeeds and storage is disabled.
 - Upstash: the database question limit remains as fallback and an error is logged.
+- Monitoring: `MONITORING_PROVIDER=webhook` sends bounded error metadata and request IDs to `MONITORING_DSN`. Request bodies and business records are not forwarded. Provider failure never replaces the application response.
 
 ## Incident handling
 

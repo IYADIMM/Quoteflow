@@ -1,7 +1,7 @@
 # QuoteFlow Final Production Hardening Report
 
 **Date:** 2026-10-08  
-**Status:** Release candidate for controlled staging. External production readiness is not claimed.
+**Status:** `STAGING_READY`. External beta or production readiness is not claimed.
 
 ## A. What changed
 
@@ -23,11 +23,11 @@
 
 ### Security, account and operations
 
-- Added Stripe event replay protection, optional hashed-subject Upstash rate limiting, request IDs and structured completion logs.
+- Added Stripe event replay protection, optional hashed-subject Upstash rate limiting for authentication and public abuse paths, request IDs, structured completion logs, and an optional redacting webhook monitoring adapter.
 - Added owner data export and organization deletion request/cancellation with seven-day cooling period.
-- Added password change, logout-other-sessions, team role change/removal, session revocation and owner protection APIs.
+- Added verified-email enforcement/resend, password change, logout-other-sessions, team role change/removal, session revocation, audited ownership transfer, and sole Owner account deletion protection.
 - Extended configuration validation for Stripe, storage and distributed rate limiting.
-- Added backup/restore scripts, release check, license inventory, support/incident/staging/release/smoke documentation.
+- Added backup/restore scripts, non-destructive staging database qualification, GitHub Actions CI, release check, license inventory, support/incident/staging/release/smoke documentation.
 
 ### Tests and product
 
@@ -45,14 +45,16 @@ Release gates still required: managed PostgreSQL migration/runtime, live Netlify
 - `node scripts/release-check.mjs`: **passed**.
   - Prisma schema validation: passed.
   - Prisma Client 7.10.0 generation: passed.
-  - Automated Node test suite: **43/43 passed**.
+  - Automated Node test suite: **50/50 passed**.
   - Static build (`node scripts/build.mjs`): passed.
 - Headless Edge browser workflow/responsive regression: **51/51 passed**, zero page errors.
 - `node --check` on frontend/API/providers/scripts: passed.
+- `pnpm audit --prod --audit-level=high`: **passed; no known production dependency vulnerabilities** after upgrading Netlify CLI and pinning patched Prisma transitive packages.
+- Full development dependency audit: latest Netlify CLI still reports upstream high advisories in local development-only transitive packages; no critical advisories remain after the upgrade.
 - Secret/legacy negative search: no SQLite, old demo API, mailto portal, nullable Gemini schema, TODO or FIXME in active source. Matches were development example URLs, intended structured logs, UI placeholders and documentation/test terms.
 - `prisma migrate deploy`: attempted; **failed before applying migrations** because localhost PostgreSQL was unavailable. No database was modified.
 - PostgreSQL restore drill: not run because PostgreSQL client tools/database were unavailable.
-- `npm` was unavailable in this runtime; the exact release components were run directly with Node. A dependency install had previously completed package placement with pnpm but reported its Windows ignored-build-script/symlink policy condition.
+- `npm` was unavailable in this runtime. `pnpm install --frozen-lockfile` updated package placement but returned the runtime's ignored-build-script policy error; the complete release check passed afterward with the installed dependency tree. CI performs a frozen pnpm install on Linux.
 
 ## D. Remaining external steps
 
@@ -63,7 +65,7 @@ Release gates still required: managed PostgreSQL migration/runtime, live Netlify
 - Configure/verify Gemini key and quota project.
 - Configure private S3/R2/B2 bucket, CORS, lifecycle, backup and malware-scanning policy.
 - Configure Upstash REST rate limiter for multi-instance public traffic.
-- Select monitoring/alerting and privacy-conscious analytics providers.
+- Configure a monitoring webhook/alerting provider and privacy-conscious analytics provider if desired.
 - Execute staging smoke, load checks, penetration/IDOR review and isolated restore drill.
 - Obtain legal review of privacy, terms, retention and quote-acceptance language.
 
@@ -89,6 +91,7 @@ Release gates still required: managed PostgreSQL migration/runtime, live Netlify
 | `STORAGE_FORCE_PATH_STYLE`, `STORAGE_MAX_UPLOAD_BYTES` | Provider compatibility/upload bound. |
 | `PDF_FONT_PATH` | Optional Unicode-capable server font. |
 | `RATE_LIMIT_PROVIDER`, `RATE_LIMIT_REST_URL`, `RATE_LIMIT_REST_TOKEN` | Optional Upstash distributed limiter. |
+| `MONITORING_PROVIDER`, `MONITORING_DSN` | Optional bounded webhook error monitoring. |
 
 ## F. Deployment sequence
 
@@ -113,10 +116,10 @@ Residual risks: no independent assessment or live IDOR/penetration exercise; no 
 ## I. Known limitations
 
 - Attachment-to-Gemini text extraction is not implemented; AI extraction uses reviewed pasted text.
-- Ownership transfer, email change and self-service user deletion remain incomplete.
-- Team/security management server APIs do not yet have a complete settings UI.
+- Email change remains incomplete. Safe user deletion is server-side but does not yet have a Settings flow.
+- Settings exposes verification, password/session controls and ownership transfer; team role change/removal still lacks a complete UI.
 - Large tenant lists lack cursor pagination/virtualization.
-- No monitoring or product-analytics vendor is embedded.
+- Monitoring has a vendor-neutral webhook adapter; live routing is unverified. No product-analytics vendor is embedded.
 - Logo image rendering is not yet included in the PDF; company name/details provide current branding.
 - No live PostgreSQL/provider/deployment/restore verification was possible here.
 
@@ -146,8 +149,8 @@ A competent independent team has architecture, inventory, migration, provider, s
 | Security | 8.1 | Good controls, no independent review or malware scanner. |
 | Billing | 8.0 | Real Stripe code and tests; no test-mode end-to-end. |
 | Reliability | 8.0 | Idempotency/failure paths/runbooks exist; restore and provider failures need live drills. |
-| Observability | 7.2 | Health, request IDs and structured logs exist; alerting vendor/dashboards are external. |
-| Test coverage | 8.6 | 43 automated + 51 browser checks; no real PostgreSQL/provider/load suite. |
+| Observability | 7.8 | Health, request IDs, structured logs and a redacting webhook adapter exist; live alerting remains external. |
+| Test coverage | 8.8 | 50 automated + 51 browser checks; no real PostgreSQL/provider/load suite. |
 | Deployment readiness | 7.8 | Netlify/build/migrations documented; production infrastructure unavailable. |
 | Commercialization | 8.0 | Billing, demo, plan/validation docs exist; no validated demand or traction. |
 | Acquisition readiness | 8.8 | Broad data room/transfer package; IP/legal/live operations diligence remains. |

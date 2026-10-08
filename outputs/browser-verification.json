@@ -1,7 +1,8 @@
 {
-  "passed": 51,
+  "passed": 52,
   "checks": [
     "Demo opens",
+    "Product logo loads",
     "Keyboard workspace search",
     "Title survives adding a line",
     "Notes survive adding a line",

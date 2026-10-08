@@ -19,7 +19,7 @@
 
 ## Technical acceptance
 
-- [ ] `npm run release:check` passes on buyer infrastructure.
+- [ ] `pnpm run release:check` passes on buyer infrastructure.
 - [ ] Forward migrations apply to isolated staging.
 - [ ] Complete `PRODUCTION_SMOKE_TEST.md` and restore drill.
 - [ ] Buyer can deploy, roll back, inspect request IDs and handle the three incident playbooks.

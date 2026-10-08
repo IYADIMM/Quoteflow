@@ -10,7 +10,7 @@ The value is the integrated RFQ-to-response workflow: fixed-point pricing, catal
 
 ## What passed?
 
-On 2026-10-08: Prisma validation/generation, static build and 42 automated tests. A prior UX phase recorded 51 browser checks. Provider tests are mocks.
+On 2026-10-08: a clean source-only dependency install, Prisma validation/generation, static build, 50 automated tests and 52 browser checks. Provider tests are mocks.
 
 ## What remains unverified?
 
@@ -26,7 +26,7 @@ Netlify hosts the static/function deployment and Prisma targets PostgreSQL. Gemi
 
 ## Main known engineering risks
 
-No live database/provider verification; missing automatic malware scanner; incomplete team/account administration; no large-dataset pagination; monitoring vendor not wired; deletion execution remains operational/manual.
+No live database/provider verification; missing automatic malware scanner; email change and some team/account UI remain incomplete; no large-dataset pagination; monitoring destination is not configured; organization deletion execution remains operator-assisted.
 
 ## Can a new team operate it?
 

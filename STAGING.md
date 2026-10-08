@@ -10,6 +10,8 @@ Required rules:
 4. Create test Stripe products/prices and subscribe only with Stripe test cards.
 5. Keep the bucket private; set short CORS allowance only for the staging origin and PUT methods required by signed uploads.
 6. Use obviously fictional customers and addresses. Never clone production without a written sanitization procedure.
-7. Run `npm run release:check` and the complete production smoke test before promotion.
+7. Run migrations, `pnpm run db:qualify`, `pnpm run release:check`, and the complete `STAGING_QUALIFICATION.md` gate before promotion.
 
 Promotion means repeating the release against production configuration. Staging success does not validate production DNS, sender reputation, live Stripe keys, backup policy or provider quotas.
+
+The current classification is recorded in `RELEASE_STATUS.md`.

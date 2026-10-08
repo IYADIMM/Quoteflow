@@ -14,9 +14,9 @@ Record date, environment, deploy ID, operator and evidence links. Use fictional 
 10. Accept exact revision; verify duplicate/collision denial. Create revision and confirm old document remains unchanged.
 11. Rotate link; old token fails/new token works. Revoke; new token fails. Test quote expiry.
 12. Complete Stripe test Checkout, verify signed webhook/subscription/entitlement, open Customer Portal, cancel at period end and verify webhook state.
-13. Verify data export, deletion cooling-off/cancellation, structured logs, alerts, private storage objects and backup freshness.
+13. Verify data export, operator-assisted deletion request/cancellation, structured logs, monitoring alerts, private storage objects and backup freshness.
 14. Execute isolated restore drill and verify recovered commercial records.
 
 ### Current execution record — 2026-10-08
 
-Automated release check passed with 42 tests; Prisma validation/generation and static build passed. Earlier browser workflow QA passed 51 checks. Live steps 1–14 were not executed because PostgreSQL and external provider credentials/endpoints were unavailable. `prisma migrate deploy` was attempted and failed before migration because localhost PostgreSQL was unavailable.
+Automated release checks pass with 50 tests; Prisma validation/generation and static build pass. Earlier browser workflow QA passed 51 checks. Live steps 1–14 were not executed because PostgreSQL and external provider credentials/endpoints were unavailable. `prisma migrate deploy` was attempted and failed before migration because localhost PostgreSQL was unavailable. Status remains `STAGING_READY`.

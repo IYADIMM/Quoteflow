@@ -4,11 +4,11 @@ QuoteFlow is a B2B request-for-quotation and quote workflow with a browser demo 
 
 ## Local setup
 
-Requires Node.js 22.13+ and PostgreSQL. Copy `.env.example` to `.env`, set `DATABASE_URL` and `DIRECT_URL`, then start PostgreSQL (for example, `docker compose up -d`). Install dependencies and run:
+Requires Node.js 22.13+, pnpm 11.25.0, and PostgreSQL. Install pnpm using its official installer (or `npm install --global pnpm@11.25.0` when npm is available). Copy `.env.example` to `.env`, set `DATABASE_URL` and `DIRECT_URL`, then start PostgreSQL (for example, `docker compose up -d`). Install the locked dependencies and run:
 
 ```sh
-npm install
-npm run dev
+pnpm install --frozen-lockfile
+pnpm run dev
 ```
 
 The command builds the static site, deploys Prisma migrations, and starts Netlify Dev at `http://localhost:8888`. The browser demo uses fictional records in local browser storage. Account mode uses PostgreSQL; it does not use demo records. `.env` is ignored by Git.
@@ -27,18 +27,19 @@ The command builds the static site, deploys Prisma migrations, and starts Netlif
 - Resend email adapter for verification, recovery, invitations and quote delivery.
 - Organization billing through Stripe-hosted Checkout and Customer Portal, verified/idempotent webhooks, centralized Free/Pro/Business entitlements, quotas, and a documented seven-day past-due grace policy.
 - Server-generated multi-page quotation PDFs built only from immutable customer snapshots, plus optional private S3-compatible storage for generated documents and validated RFQ attachments.
-- Structured request logs with request IDs, PostgreSQL health checks, optional Upstash distributed limiting for public questions, owner data export, and a seven-day organization deletion cooling period.
+- Structured request logs with request IDs, PostgreSQL health checks, optional webhook error monitoring, optional Upstash distributed limiting for authentication/invitations/public questions, owner data export, and an operator-assisted seven-day organization deletion cooling period.
+- Verified-email enforcement for commercial/sensitive actions, rate-limited verification resend, password/session controls, audited ownership transfer, and self-service user deletion that blocks sole organization Owners.
 - A responsive commercial workspace with an attention-driven dashboard, global keyboard search, live quote profitability, clear approval/send review, accessible forms, professional customer documents, and an isolated fictional demo.
 - `.env.example`, local Postgres compose setup, build scripts, security headers, automated business-rule tests, and browser workflow checks.
 
 ## Configuration
 
-Required for production: `DATABASE_URL` (pooled PostgreSQL URL), `DIRECT_URL` (direct/migration URL), and `APP_URL` (public HTTPS origin). Sessions use cryptographically random bearer tokens stored as SHA-256 hashes; no `SESSION_SECRET` is used or required. Optional provider configuration is documented in `.env.example`: Gemini, Resend, Stripe, S3-compatible storage, a PDF font, and Upstash rate limiting all fail closed when explicitly enabled but incomplete.
+Required for production: `DATABASE_URL` (pooled PostgreSQL URL), `DIRECT_URL` (direct/migration URL), and `APP_URL` (public HTTPS origin). Sessions use cryptographically random bearer tokens stored as SHA-256 hashes; no `SESSION_SECRET` is used or required. Optional provider configuration is documented in `.env.example`: Gemini, Resend, Stripe, S3-compatible storage, a PDF font, Upstash rate limiting, and webhook monitoring fail safely when disabled and validate required settings when enabled.
 
-Netlify build runs `npm run build`; publish directory is `dist`; function directory is `netlify/functions`. Apply database migrations with `npm run db:migrate` during release operations. Do not publish the repository root.
+Netlify build runs `pnpm run build`; publish directory is `dist`; function directory is `netlify/functions`. Apply database migrations with `pnpm run db:migrate` during release operations. Do not publish the repository root.
 
 ## Verification and limits
 
-Run `npm run release:check` for Prisma validation/generation, the complete automated suite, and the static build. Provider tests use mocked Gemini, Resend, Stripe, S3 and Upstash behavior. The demo is browser-local and fictional; account data is server-authoritative. On 8 October 2026, 42 automated tests, Prisma schema validation/client generation, the static build, and the previously established 51 browser workflow/responsive checks passed in this workspace. A live PostgreSQL migration attempt failed because no local PostgreSQL server or client tools were available. No Netlify deployment or live provider request was performed. See `PRODUCTION_SMOKE_TEST.md` for the credential-dependent staging checks.
+Run `pnpm run release:check` for Prisma validation/generation, the complete automated suite, and the static build. Provider tests use mocked Gemini, Resend, Stripe, S3, Upstash, and monitoring behavior. RFQs are entered manually or created from user-supplied text; there is no automatic mailbox ingestion. RFQ attachments are securely uploaded but are not automatically OCRed or extracted. The demo is browser-local and fictional; account data is server-authoritative. On 8 October 2026, a clean source-only install passed 50 automated tests, Prisma schema validation/client generation, the static build, and 52 browser workflow/responsive checks. A live PostgreSQL migration attempt failed because no local PostgreSQL server or client tools were available. No Netlify deployment or live provider request was performed. Current classification is `STAGING_READY`; see `RELEASE_STATUS.md` and `STAGING_QUALIFICATION.md`.
 
 See [PRODUCT.md](PRODUCT.md), [ARCHITECTURE.md](ARCHITECTURE.md), [SECURITY.md](SECURITY.md), and [DEPLOYMENT.md](DEPLOYMENT.md).

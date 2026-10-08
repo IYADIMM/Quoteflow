@@ -11,7 +11,7 @@ $pgRestore = Get-Command pg_restore -ErrorAction Stop
 $psql = Get-Command psql -ErrorAction Stop
 & $pgRestore.Source --clean --if-exists --no-owner --no-acl --dbname=$TargetDatabaseUrl $BackupFile
 if ($LASTEXITCODE -ne 0) { throw 'PostgreSQL restore failed.' }
-$required = @('Organization','User','Customer','CatalogItem','RFQ','Quote','QuoteEvent','FollowUp','Subscription','AuditLog')
+$required = @('Organization','User','Membership','Customer','CatalogItem','RFQ','RFQItem','Quote','QuoteItem','QuoteApproval','QuoteAcceptance','QuoteEvent','FollowUp','Subscription','Attachment','AuditLog')
 foreach ($table in $required) {
   $count = & $psql.Source $TargetDatabaseUrl --tuples-only --no-align --command="SELECT COUNT(*) FROM \"$table\";"
   if ($LASTEXITCODE -ne 0 -or $count -notmatch '^\d+$') { throw "Restore verification failed for $table." }

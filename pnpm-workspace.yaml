@@ -1,9 +1,16 @@
+packages:
+  - .
+
 allowBuilds:
-  '@google/genai': set this to true or false
-  '@prisma/engines': set this to true or false
-  esbuild: set this to true or false
-  netlify-cli: set this to true or false
-  prisma: set this to true or false
-  protobufjs: set this to true or false
-  sharp: set this to true or false
-  unix-dgram: set this to true or false
+  '@google/genai': true
+  '@prisma/engines': true
+  esbuild: true
+  netlify-cli: true
+  prisma: true
+  protobufjs: true
+  sharp: true
+  unix-dgram: false
+
+overrides:
+  deepmerge-ts: 8.0.2
+  mysql2: 3.24.5
