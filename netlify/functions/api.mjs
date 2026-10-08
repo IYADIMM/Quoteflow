@@ -25,6 +25,11 @@ const json = (statusCode, body, headers = {}) => {
 };
 const binary = (statusCode, body, contentType, fileName) => ({ statusCode, isBase64Encoded: true, headers: { 'content-type': contentType, 'content-disposition': `attachment; filename="${String(fileName).replace(/[^a-zA-Z0-9_.-]/g, '_')}"`, 'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' }, body: body.toString('base64') });
 const requireVerifiedEmail = user => user?.emailVerifiedAt ? null : json(403, { error: 'Verify your email before performing this action.', code: 'EMAIL_VERIFICATION_REQUIRED' });
+/** Never put customer bearer tokens into logs, monitoring or traces. */
+export const sanitizedRequestPath = path => String(path || '')
+  .replace(/\/api\/public\/quote\/[^/]+/g, '/api/public/quote/[redacted]')
+  .replace(/\/public\/quote\/[^/]+/g, '/public/quote/[redacted]')
+  .replace(/\/q\/[^/]+/g, '/q/[redacted]');
 async function passwordMatches(user, password) {
   if (typeof password !== 'string' || password.length > 256) return false;
   const [saltHex, expectedHex] = String(user?.passwordHash || '').split(':'), expected = Buffer.from(expectedHex || '', 'hex');
@@ -127,7 +132,7 @@ export function createHandler(dependencies = {}) {
 
   if (path === '/client-error' && method === 'POST') {
     const limited = await throttle('client-error', requestIp, 10, 300); if (limited) return limited;
-    const monitor = makeMonitor(config); if (monitor) await monitor.capture({ event: 'frontend_exception', message: String(body.message || '').slice(0, 500), path: String(body.path || '').slice(0, 300), provider: 'browser' }).catch(() => {});
+    const monitor = makeMonitor(config); if (monitor) await monitor.capture({ event: 'frontend_exception', message: String(body.message || '').slice(0, 500), path: sanitizedRequestPath(String(body.path || '').slice(0, 300)), provider: 'browser' }).catch(() => {});
     return json(202, { received: true });
   }
 
@@ -997,8 +1002,9 @@ const legacyEventAdapter = createHandler();
 
 /** Modern Netlify Functions request/response entry point. */
 export default async function netlifyHandler(request, context) {
-  const startedAt = Date.now(), requestId = request.headers.get('x-request-id') || randomBytes(12).toString('hex');
+  const startedAt = Date.now(), requestId = randomBytes(12).toString('hex');
   const url = new URL(request.url);
+  const safeLogPath = sanitizedRequestPath(url.pathname);
   const headers = Object.fromEntries(request.headers.entries());
   if (context?.ip) headers['x-nf-client-connection-ip'] = context.ip;
   let body = '';
@@ -1012,14 +1018,14 @@ export default async function netlifyHandler(request, context) {
   try { monitor = createMonitor(readConfig()); } catch {}
   try { result = await legacyEventAdapter({ path: url.pathname, httpMethod: request.method, headers, body }); }
   catch (error) {
-    console.error('unhandled_api_error', { requestId, method: request.method, path: url.pathname, message: error.message });
-    if (monitor) await monitor.capture({ event: 'unhandled_api_error', message: error.message, requestId, method: request.method, path: url.pathname, status: 500 }).catch(() => {});
+    console.error('unhandled_api_error', { requestId, method: request.method, path: safeLogPath, message: error.message });
+    if (monitor) await monitor.capture({ event: 'unhandled_api_error', message: error.message, requestId, method: request.method, path: safeLogPath, status: 500 }).catch(() => {});
     result = json(500, { error: 'An unexpected server error occurred.', requestId });
   }
   const responseHeaders = new Headers(result.headers || {});
   responseHeaders.set('x-request-id', requestId);
   for (const cookie of result.multiValueHeaders?.['set-cookie'] || []) responseHeaders.append('set-cookie', cookie);
-  console.log(JSON.stringify({ level: 'info', event: 'request_completed', requestId, method: request.method, path: url.pathname, status: result.statusCode || 200, durationMs: Date.now() - startedAt }));
-  if (monitor && (result.statusCode || 200) >= 500) await monitor.capture({ event: 'api_failure', message: 'API request failed', requestId, method: request.method, path: url.pathname, status: result.statusCode || 500 }).catch(() => {});
+  console.log(JSON.stringify({ level: 'info', event: 'request_completed', requestId, method: request.method, path: safeLogPath, status: result.statusCode || 200, durationMs: Date.now() - startedAt }));
+  if (monitor && (result.statusCode || 200) >= 500) await monitor.capture({ event: 'api_failure', message: 'API request failed', requestId, method: request.method, path: safeLogPath, status: result.statusCode || 500 }).catch(() => {});
   return new Response(result.isBase64Encoded ? Buffer.from(result.body || '', 'base64') : result.body || '', { status: result.statusCode || 200, headers: responseHeaders });
 }
