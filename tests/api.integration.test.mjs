@@ -377,3 +377,38 @@ test('authenticated PDF downloads reuse archived private PDF rather than allocat
   assert.equal(uploads, 1);
   assert.equal(renders, 1);
 });
+
+test('late Stripe events cannot overwrite newer reconciled subscription state', async () => {
+  const billingConfig = { ...config, stripe: { enabled: true, secretKey: 'sk_test', webhookSecret: 'whsec_test', prices: { PRO: 'price_pro' } } };
+  const current = { id: 'sub-1', customer: 'cus-1', status: 'active', metadata: { quoteflowOrganizationId: 'org-1' }, items: { data: [{ price: { id: 'price_pro', product: 'prod-pro' } }] } };
+  const events = [
+    { id: 'evt-new', created: 200, livemode: false, type: 'customer.subscription.updated', data: { object: current } },
+    { id: 'evt-old', created: 100, livemode: false, type: 'customer.subscription.deleted', data: { object: { ...current, status: 'canceled' } } }
+  ];
+  let stored = null, auditCount = 0, retrieved = 0;
+  const tx = {
+    stripeEvent: { create: async () => ({}) },
+    subscription: {
+      findUnique: async () => stored,
+      create: async ({ data }) => { stored = data; return stored; },
+      updateMany: async ({ data }) => { stored = { ...stored, ...data }; return { count: 1 }; }
+    },
+    auditLog: { create: async () => { auditCount++; } }
+  };
+  const handler = createHandler({
+    readConfig: () => billingConfig,
+    getPrisma: async () => ({ $transaction: async fn => fn(tx) }),
+    billingProvider: () => ({
+      constructEvent: async () => events.shift(),
+      retrieveSubscription: async id => { assert.equal(id, 'sub-1'); retrieved++; return current; }
+    })
+  });
+  const event = { path: '/api/stripe/webhook', httpMethod: 'POST', headers: { 'stripe-signature': 'signature' }, body: '{"event":1}' };
+  assert.equal((await handler(event)).statusCode, 200);
+  assert.equal(stored.status, 'ACTIVE');
+  assert.equal((await handler(event)).statusCode, 200);
+  assert.equal(stored.status, 'ACTIVE');
+  assert.equal(stored.lastStripeEventAt.getTime(), 200000);
+  assert.equal(auditCount, 1);
+  assert.equal(retrieved, 2);
+});
