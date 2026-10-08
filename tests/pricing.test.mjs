@@ -34,3 +34,23 @@ test('invalid quantity, negative prices, excessive tax and excessive discount ar
   assert.throws(() => calculateQuote({ discount: 0, items: [{ qty: 1, price: 5, cost: 1, tax: 101 }] }));
   assert.throws(() => calculateQuote({ discount: 51, items: [{ qty: 1, price: 50, cost: 1, tax: 0 }] }));
 });
+
+test('discount allocation reconciles to the last four-decimal unit', () => {
+  const quote = calculateQuote({ discount: '0.0001', items: Array.from({ length: 3 }, () => ({ qty: 1, price: 1, cost: 0, tax: 5 })) });
+  const allocatedUnits = quote.lines.map(line => Math.round(line.discountAllocated * 10000));
+  assert.deepEqual(allocatedUnits, [1, 0, 0]);
+  assert.equal(allocatedUnits.reduce((a, b) => a + b, 0), 1);
+  assert.equal(quote.lines.reduce((a, line) => a + Math.round(line.net * 10000), 0), Math.round(quote.subtotal * 10000));
+});
+
+test('discount allocation reconciles for 200 taxable lines, full discounts and mixed prices', () => {
+  const items = Array.from({ length: 200 }, (_, i) => ({ qty: 1, price: (1 + (i % 13) / 10).toFixed(4), cost: 0, tax: i % 2 ? 5 : 10 }));
+  const result = calculateQuote({ items, discount: '0.0531' });
+  const units = value => Math.round(value * 10000);
+  assert.equal(result.lines.reduce((sum, line) => sum + units(line.discountAllocated), 0), units(result.discount));
+  assert.equal(result.lines.reduce((sum, line) => sum + units(line.net), 0), units(result.subtotal));
+  assert.equal(units(result.total), units(result.subtotal) + units(result.tax));
+  const full = calculateQuote({ items, discount: result.gross.toFixed(4) });
+  assert.equal(full.subtotal, 0);
+  assert.ok(full.lines.every(line => line.net === 0 && line.discountAllocated === line.revenue));
+});
