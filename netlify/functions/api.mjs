@@ -74,6 +74,14 @@ const authCookies = (sessionToken, production) => {
   return [`qf_session=${sessionToken}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${secure}`, `qf_csrf=${csrfToken}; SameSite=Lax; Path=/; Max-Age=2592000${secure}`];
 };
 
+async function teamHasCapacity(tx, organizationId) {
+  const [subscription, members] = await Promise.all([
+    tx.subscription.findUnique({ where: { organizationId } }),
+    tx.membership.count({ where: { organizationId } })
+  ]);
+  return members < entitlementsFor(subscription, { teamMembers: members }).limits.teamMembers;
+}
+
 export async function reserveAIUsage(prisma, organizationId, feature, config, ip) {
   const minuteAgo = new Date(Date.now() - 60_000);
   const requestKey = sha256(ip || 'unknown');
@@ -217,6 +225,7 @@ export function createHandler(dependencies = {}) {
           const claimed = await tx.invitation.updateMany({ where: { id: invitation.id, acceptedAt: null, expiresAt: { gt: new Date() } }, data: { acceptedAt: new Date() } });
           if (!claimed.count) throw new Error('INVITATION_CLAIMED');
           organization = invitation.organization; memberRole = invitation.role;
+          if (!await teamHasCapacity(tx, organization.id)) throw new Error('TEAM_LIMIT');
           await tx.membership.create({ data: { userId: user.id, organizationId: organization.id, role: memberRole } });
         } else {
           organization = await tx.organization.create({ data: { name: organizationName, settings: { create: { data: { company: organizationName, currency: 'AED', tax: 5, margin: 20, validity: 30 } } }, subscription: { create: { plan: 'FREE', status: 'ACTIVE' } } } });
@@ -224,7 +233,7 @@ export function createHandler(dependencies = {}) {
         }
         await tx.session.create({ data: { tokenHash: sha256(sessionToken), userId: user.id, organizationId: organization.id, expiresAt: new Date(Date.now() + 30 * 864e5) } });
         return { user, organization, memberRole };
-      });
+      }, { isolationLevel: 'Serializable' });
       const emailProvider = makeEmail(config);
       let verificationSent = false;
       if (emailProvider) {
@@ -234,7 +243,7 @@ export function createHandler(dependencies = {}) {
         catch (error) { console.error('verification_email_failed', { userId: result.user.id, message: error.message }); }
       }
       return json(201, { user: { id: result.user.id, email }, organization: { id: result.organization.id, name: result.organization.name }, role: result.memberRole, onboardingRequired: !invitation, verificationSent }, { 'set-cookie': authCookies(sessionToken, config.production) });
-    } catch (error) { if (error.code === 'P2002') return json(409, { error: 'An account already exists for this email.' }); if (error.message === 'INVITATION_CLAIMED') return json(409, { error: 'This invitation was already accepted.' }); throw error; }
+    } catch (error) { if (error.code === 'P2002') return json(409, { error: 'An account already exists for this email.' }); if (error.message === 'INVITATION_CLAIMED') return json(409, { error: 'This invitation was already accepted.' }); if (error.message === 'TEAM_LIMIT') return json(402, { error: 'The organization team-member limit has been reached.' }); if (error.code === 'P2034') return json(409, { error: 'Concurrent signup detected. Retry your invitation.' }); throw error; }
   }
   if (path === '/auth/login' && method === 'POST') {
     const email = String(body.email || '').trim().toLowerCase();
@@ -765,12 +774,15 @@ export function createHandler(dependencies = {}) {
       await prisma.$transaction(async tx => {
         const claimed = await tx.invitation.updateMany({ where: { id: invitation.id, acceptedAt: null, expiresAt: { gt: new Date() } }, data: { acceptedAt: new Date() } });
         if (!claimed.count) throw new Error('INVITATION_CLAIMED');
+        if (!await teamHasCapacity(tx, invitation.organizationId)) throw new Error('TEAM_LIMIT');
         await tx.membership.create({ data: { userId: user.id, organizationId: invitation.organizationId, role: invitation.role } });
         await tx.auditLog.create({ data: { organizationId: invitation.organizationId, actorUserId: user.id, action: 'team.invitation.accepted', objectType: 'Invitation', objectId: invitation.id } });
         await tx.session.update({ where: { id: principal.session.id }, data: { organizationId: invitation.organizationId } });
-      });
+      }, { isolationLevel: 'Serializable' });
     } catch (error) {
       if (error.message === 'INVITATION_CLAIMED') return json(409, { error: 'This invitation was already accepted.' });
+      if (error.message === 'TEAM_LIMIT') return json(402, { error: 'The organization team-member limit has been reached.' });
+      if (error.code === 'P2034') return json(409, { error: 'Concurrent invitation acceptance detected. Retry.' });
       throw error;
     }
     return json(200, { organization: { id: invitation.organization.id, name: invitation.organization.name }, role: invitation.role });
