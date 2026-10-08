@@ -185,9 +185,9 @@ test('Stripe webhooks verify signatures, persist subscription state and ignore d
   const billingConfig = { ...config, stripe: { enabled: true, secretKey: 'sk_test', webhookSecret: 'whsec_test', prices: { PRO: 'price_pro', BUSINESS: 'price_business' } }, storage: { enabled: false }, pdf: {} };
   const stripeEvent = { id: 'evt_1', type: 'customer.subscription.updated', livemode: false, data: { object: { id: 'sub_1', customer: 'cus_1', status: 'active', current_period_start: 10, current_period_end: 20, metadata: { quoteflowOrganizationId: 'org-1' }, items: { data: [{ price: { id: 'price_pro', product: 'prod_1' } }] } } } };
   let storedSubscription, signatureCalls = 0;
-  const tx = { stripeEvent: { create: async ({ data }) => { assert.equal(data.id, 'evt_1'); } }, subscription: { upsert: async ({ create }) => { storedSubscription = create; } }, auditLog: { create: async () => ({}) } };
+  const tx = { stripeEvent: { create: async ({ data }) => { assert.equal(data.id, 'evt_1'); } }, subscription: { findUnique: async () => null, create: async ({ data }) => { storedSubscription = data; } }, auditLog: { create: async () => ({}) } };
   const prisma = { $transaction: async fn => fn(tx) };
-  const provider = () => ({ constructEvent: async (payload, signature) => { signatureCalls++; assert.equal(payload, '{"event":true}'); assert.equal(signature, 'valid-signature'); return stripeEvent; } });
+  const provider = () => ({ constructEvent: async (payload, signature) => { signatureCalls++; assert.equal(payload, '{"event":true}'); assert.equal(signature, 'valid-signature'); return stripeEvent; }, retrieveSubscription: async id => { assert.equal(id, 'sub_1'); return stripeEvent.data.object; } });
   const handler = createHandler({ readConfig: () => billingConfig, getPrisma: async () => prisma, billingProvider: provider });
   const result = await handler({ path: '/api/stripe/webhook', httpMethod: 'POST', headers: { 'stripe-signature': 'valid-signature' }, body: '{"event":true}' });
   assert.equal(result.statusCode, 200);
