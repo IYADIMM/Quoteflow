@@ -481,10 +481,30 @@ export function createHandler(dependencies = {}) {
     if (!config.storage.enabled) return json(503, { error: 'Object storage is not configured.' });
     let file; try { file = validateUpload(body, config.storage.maxUploadBytes); } catch (error) { return json(400, { error: error.message }); }
     const rfqId = body.rfqId ? String(body.rfqId) : null; if (rfqId && !await prisma.rFQ.findFirst({ where: { id: rfqId, organizationId: organization.id, deletedAt: null } })) return json(404, { error: 'RFQ not found.' });
-    const subscription = await prisma.subscription.findUnique({ where: { organizationId: organization.id } }), used = await prisma.attachment.aggregate({ where: { organizationId: organization.id, deletedAt: null }, _sum: { byteSize: true } }), entitlement = entitlementsFor(subscription, { storageBytes: used._sum.byteSize || 0 });
-    if (file.byteSize > entitlement.available.storageBytes) return json(402, { error: 'Organization storage quota would be exceeded.' });
-    const key = storageKey(organization.id, file.extension), attachment = await prisma.attachment.create({ data: { organizationId: organization.id, rfqId, storageKey: key, provider: config.storage.provider, fileName: file.fileName, mimeType: file.mimeType, byteSize: file.byteSize, sha256: /^[a-f0-9]{64}$/i.test(body.sha256 || '') ? body.sha256.toLowerCase() : 'pending' } });
-    const uploadUrl = await makeStorage(config).createUploadUrl({ key, mimeType: file.mimeType, byteSize: file.byteSize }); return json(201, { attachment: { id: attachment.id, fileName: attachment.fileName, status: attachment.status }, uploadUrl, expiresIn: 900 });
+    const key = storageKey(organization.id, file.extension);
+    let attachment;
+    try {
+      attachment = await prisma.$transaction(async tx => {
+        const [subscription, used] = await Promise.all([
+          tx.subscription.findUnique({ where: { organizationId: organization.id } }),
+          tx.attachment.aggregate({ where: { organizationId: organization.id, deletedAt: null }, _sum: { byteSize: true } })
+        ]);
+        if (file.byteSize > entitlementsFor(subscription, { storageBytes: used._sum.byteSize || 0 }).available.storageBytes) return null;
+        // PENDING reservations count towards quota to stop concurrent uploads.
+        return tx.attachment.create({ data: { organizationId: organization.id, rfqId, storageKey: key, provider: config.storage.provider, fileName: file.fileName, mimeType: file.mimeType, byteSize: file.byteSize, sha256: /^[a-f0-9]{64}$/i.test(body.sha256 || '') ? body.sha256.toLowerCase() : 'pending' } });
+      }, { isolationLevel: 'Serializable' });
+    } catch (error) {
+      if (error.code === 'P2034') return json(409, { error: 'A concurrent storage reservation is in progress. Please retry.' });
+      throw error;
+    }
+    if (!attachment) return json(402, { error: 'Organization storage quota would be exceeded.' });
+    try {
+      const uploadUrl = await makeStorage(config).createUploadUrl({ key, mimeType: file.mimeType, byteSize: file.byteSize });
+      return json(201, { attachment: { id: attachment.id, fileName: attachment.fileName, status: attachment.status }, uploadUrl, expiresIn: 900 });
+    } catch (error) {
+      await prisma.attachment.update({ where: { id: attachment.id }, data: { status: 'REJECTED', deletedAt: new Date() } }).catch(() => {});
+      return json(503, { error: 'A private upload could not be prepared. Retry later.' });
+    }
   }
   const attachmentMatch = /^\/attachments\/([^/]+)(?:\/(complete|download))?$/.exec(path);
   if (attachmentMatch) {
