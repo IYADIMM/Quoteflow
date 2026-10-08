@@ -5,6 +5,7 @@ import { getPrisma } from '../../lib/prisma.mjs';
 import { GeminiProvider } from '../../lib/ai-provider.mjs';
 import { createEmailProvider } from '../../lib/email-provider.mjs';
 import { calculateQuote } from '../../lib/pricing.mjs';
+import { evaluateQuotePolicy } from '../../lib/commercial-policy.mjs';
 import { amountScaled, normalizeQuoteLines, quoteItemData, validCurrency } from '../../lib/quote-lines.mjs';
 import { StripeBillingProvider, stripePayloadHash, subscriptionRecord } from '../../lib/billing-provider.mjs';
 import { entitlementsFor } from '../../lib/entitlements.mjs';
@@ -757,9 +758,9 @@ export function createHandler(dependencies = {}) {
     const minimumMargin = Number(settings?.minMargin ?? settings?.data?.margin ?? 20);
     const marginMode = settings?.marginMode || settings?.data?.marginMode || 'WARNING';
     const belowMinimumPrice = lines.some(line => line.minimumPrice != null && amountScaled(line.price) < amountScaled(line.minimumPrice));
-    if (belowMinimumPrice && !(role === 'SALES_REP' && marginMode === 'APPROVAL_REQUIRED')) return json(409, { error: 'Selling price cannot be below the catalog minimum.' });
-    if (totals.margin < minimumMargin && marginMode === 'BLOCK') return json(409, { error: 'Quote is below the configured minimum margin.' });
-    const requiresApproval = (totals.margin < minimumMargin || belowMinimumPrice) && marginMode === 'APPROVAL_REQUIRED';
+    const policy = evaluateQuotePolicy({ margin: totals.margin, minimumMargin, marginMode, belowMinimumPrice, allowMinimumOverride: role === 'SALES_REP' });
+    if (policy.blockedReason) return json(409, { error: policy.blockedReason });
+    const requiresApproval = policy.requiresApproval;
     const status = requiresApproval ? 'INTERNAL_REVIEW' : 'DRAFT';
     const expiryDate = body.expiry ? new Date(`${body.expiry}T23:59:59.999Z`) : null;
     if (expiryDate && !Number.isFinite(expiryDate.getTime())) return json(400, { error: 'Quote expiry date is invalid.' });
@@ -778,7 +779,7 @@ export function createHandler(dependencies = {}) {
         return tx.quote.findUnique({ where: { id: prior.id }, include: { items: { orderBy: { sortOrder: 'asc' } } } });
       });
       if (!changed) return json(409, { error: 'This quote changed while you were saving. Reload and review the latest version.' });
-      return json(200, { item: quoteDTO(changed), totals, warning: totals.margin < minimumMargin && marginMode === 'WARNING' ? 'Quote is below the configured margin guideline.' : null });
+      return json(200, { item: quoteDTO(changed), totals, warning: policy.warning });
     }
     const monthStart = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1));
     const [subscription, quoteCount] = await Promise.all([prisma.subscription.findUnique({ where: { organizationId: organization.id } }), prisma.quote.count({ where: { organizationId: organization.id, createdAt: { gte: monthStart }, deletedAt: null } })]);
@@ -791,7 +792,7 @@ export function createHandler(dependencies = {}) {
       await tx.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'quote.created', objectType: 'Quote', objectId: created.id } });
       return created;
     });
-    return json(201, { item: quoteDTO(quote), totals, warning: totals.margin < minimumMargin && marginMode === 'WARNING' ? 'Quote is below the configured margin guideline.' : null });
+    return json(201, { item: quoteDTO(quote), totals, warning: policy.warning });
   }
   const approveMatch = /^\/quotes\/([^/]+)\/approve$/.exec(path);
   if (approveMatch && method === 'POST') {
@@ -822,7 +823,18 @@ export function createHandler(dependencies = {}) {
     if (quote.status === 'INTERNAL_REVIEW' && !['OWNER', 'ADMIN', 'SALES_MANAGER'].includes(role)) return json(403, { error: 'A manager must approve this quote before sending.' });
     const currentFinancialHash = financialFingerprint(quote);
     const calculatedSendTotals = calculateQuote({ items: quote.items.map(item => ({ qty: Number(item.quantity), cost: Number(item.costSnapshot), price: Number(item.sellingPrice), tax: Number(item.taxRate) })), discount: Number(quote.discount) });
-    const settingsMargin = Number(quote.organization.settings?.minMargin ?? 20), requiresApproval = calculatedSendTotals.margin < settingsMargin || quote.items.some(item => item.minimumPriceSnapshot != null && amountScaled(item.sellingPrice) < amountScaled(item.minimumPriceSnapshot));
+    const settings = quote.organization.settings;
+    const sendPolicy = evaluateQuotePolicy({
+      margin: calculatedSendTotals.margin,
+      minimumMargin: Number(settings?.minMargin ?? settings?.data?.margin ?? 20),
+      marginMode: settings?.marginMode || settings?.data?.marginMode || 'WARNING',
+      belowMinimumPrice: quote.items.some(item => item.minimumPriceSnapshot != null && amountScaled(item.sellingPrice) < amountScaled(item.minimumPriceSnapshot)),
+      // A below-catalog-minimum quote can only exist after an authorized
+      // approval-required save. Never let a changed WARNING policy waive it.
+      allowMinimumOverride: true
+    });
+    if (sendPolicy.blockedReason) return json(409, { error: sendPolicy.blockedReason });
+    const requiresApproval = sendPolicy.requiresApproval || quote.status === 'INTERNAL_REVIEW';
     if (requiresApproval) {
       const approval = await prisma.quoteApproval.findFirst({ where: { quoteId: quote.id, quoteVersion: quote.version, financialHash: currentFinancialHash }, orderBy: { createdAt: 'desc' } });
       if (!approval) return json(409, { error: 'This quote requires a current manager approval before it can be sent.' });
