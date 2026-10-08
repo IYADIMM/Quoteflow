@@ -877,16 +877,26 @@ export function createHandler(dependencies = {}) {
       return json(200, { item: quoteDTO(changed), totals, warning: policy.warning });
     }
     const monthStart = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1));
-    const [subscription, quoteCount] = await Promise.all([prisma.subscription.findUnique({ where: { organizationId: organization.id } }), prisma.quote.count({ where: { organizationId: organization.id, createdAt: { gte: monthStart }, deletedAt: null } })]);
-    if (quoteCount >= entitlementsFor(subscription, { quotesThisMonth: quoteCount }).limits.quotesPerMonth) return json(402, { error: 'Your plan monthly quotation limit has been reached.' });
-    const quote = await prisma.$transaction(async tx => {
+    let quote;
+    try {
+      quote = await prisma.$transaction(async tx => {
+      const [subscription, quoteCount] = await Promise.all([
+        tx.subscription.findUnique({ where: { organizationId: organization.id } }),
+        tx.quote.count({ where: { organizationId: organization.id, createdAt: { gte: monthStart }, deletedAt: null } })
+      ]);
+      if (quoteCount >= entitlementsFor(subscription, { quotesThisMonth: quoteCount }).limits.quotesPerMonth) return null;
       const counter = await tx.companySettings.update({ where: { organizationId: organization.id }, data: { quoteCounter: { increment: 1 } } });
       const number = `Q-${new Date().getUTCFullYear()}-${String(counter.quoteCounter).padStart(5, '0')}`;
       const created = await tx.quote.create({ data: { organizationId: organization.id, createdById: user.id, sourceQuoteId: body.sourceQuoteId || null, number, customerId, rfqId: rfq?.id || null, title, status, currency, discount: Number(body.discount || 0).toFixed(4), expiryDate, paymentTerms: String(body.paymentTerms || body.payment || '').slice(0, 500) || null, deliveryTerms: String(body.deliveryTerms || body.delivery || '').slice(0, 500) || null, customerNotes: String(body.customerNotes || body.notes || '').slice(0, 2000) || null, version: 1, items: { create: lines.map(line => ({ ...quoteItemData(line) })) } }, include: { items: { orderBy: { sortOrder: 'asc' } } } });
       await tx.quoteEvent.create({ data: { quoteId: created.id, type: 'CREATED', actorUserId: user.id } });
       await tx.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'quote.created', objectType: 'Quote', objectId: created.id } });
       return created;
-    });
+      }, { isolationLevel: 'Serializable' });
+    } catch (error) {
+      if (error.code === 'P2034') return json(409, { error: 'A concurrent quote creation is in progress. Please retry.' });
+      throw error;
+    }
+    if (!quote) return json(402, { error: 'Your plan monthly quotation limit has been reached.' });
     return json(201, { item: quoteDTO(quote), totals, warning: policy.warning });
   }
   const approveMatch = /^\/quotes\/([^/]+)\/approve$/.exec(path);
