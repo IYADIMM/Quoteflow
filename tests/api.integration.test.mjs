@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomBytes, scryptSync } from 'node:crypto';
-import { createHandler, reserveAIUsage } from '../netlify/functions/api.mjs';
+import { createHandler, reserveAIUsage, sanitizedRequestPath } from '../netlify/functions/api.mjs';
 
 const config = { production: false, appUrl: 'https://quoteflow.test', databaseUrl: 'postgres://test', ai: { enabled: true, configured: true, apiKey: 'test-only', model: 'gemini-test', maxRequestsPerMinute: 5, maxInputChars: 2000, monthlyLimits: { FREE: 25, PRO: 500, BUSINESS: 5000 } }, email: { provider: '', apiKey: '', from: '' } };
 const response = async event => {
@@ -313,4 +313,67 @@ test('account deletion refuses a sole organization owner', async () => {
   const result = await handler({ path: '/api/account', httpMethod: 'DELETE', headers: { cookie: `qf_session=${sessionToken}; qf_csrf=csrf`, 'x-csrf-token': 'csrf', origin: config.appUrl }, body: JSON.stringify({ currentPassword: password, confirm: 'DELETE MY ACCOUNT' }) });
   assert.equal(result.statusCode, 409);
   assert.match(JSON.parse(result.body).error, /Transfer ownership/);
+});
+
+test('customer maintenance is tenant-scoped and archival preserves historical data', async () => {
+  const token = 'customer-edit-session', customer = { id: 'cust-1', organizationId: 'org-1', companyName: 'Old Name', email: 'old@example.test', deletedAt: null };
+  let auditCount = 0;
+  const prisma = {
+    session: { findUnique: async () => ({ id: 'session-1', userId: 'owner', organizationId: 'org-1', expiresAt: new Date(Date.now() + 60_000), user: { id: 'owner', emailVerifiedAt: new Date() }, organization: { id: 'org-1' } }) },
+    membership: { findUnique: async () => ({ role: 'OWNER' }) },
+    customer: {
+      findFirst: async ({ where }) => where.organizationId === 'org-1' && where.id === customer.id && !customer.deletedAt ? customer : null,
+      update: async ({ data }) => Object.assign(customer, data),
+      updateMany: async ({ data }) => { Object.assign(customer, data); return { count: 1 }; }
+    },
+    auditLog: { create: async () => { auditCount++; return {}; } }
+  };
+  const handler = createHandler({ readConfig: () => config, getPrisma: async () => prisma });
+  const call = (path, method, body = {}) => handler({ path: '/api' + path, httpMethod: method, headers: { origin: config.appUrl, cookie: 'qf_session=' + token + '; qf_csrf=csrf', 'x-csrf-token': 'csrf' }, body: JSON.stringify(body) });
+  assert.equal((await call('/customers/not-ours', 'PATCH', { companyName: 'Tamper' })).statusCode, 404);
+  assert.equal((await call('/customers/cust-1', 'PATCH', { email: 'not-an-email' })).statusCode, 400);
+  const edited = await call('/customers/cust-1', 'PATCH', { companyName: 'Updated Trading', email: 'sales@example.test' });
+  assert.equal(edited.statusCode, 200);
+  assert.equal(customer.companyName, 'Updated Trading');
+  assert.equal((await call('/customers/cust-1', 'DELETE')).statusCode, 200);
+  assert.ok(customer.deletedAt instanceof Date);
+  assert.equal((await call('/customers/cust-1', 'PATCH', { companyName: 'Nope' })).statusCode, 404);
+  assert.equal(auditCount, 2);
+});
+
+test('customer bearer link tokens are redacted before request logging', () => {
+  assert.equal(sanitizedRequestPath('/api/public/quote/secret-token/pdf'), '/api/public/quote/[redacted]/pdf');
+  assert.equal(sanitizedRequestPath('/q/secret-token'), '/q/[redacted]');
+  assert.equal(sanitizedRequestPath('/api/quotes/ordinary-id/pdf'), '/api/quotes/ordinary-id/pdf');
+});
+
+test('authenticated PDF downloads reuse archived private PDF rather than allocating copies', async () => {
+  const token = 'pdf-session'; let archives = 0, renders = 0, uploads = 0, existing = null;
+  const quote = { id: 'quote1', number: 'Q-1', organizationId: 'org-1', status: 'SENT', version: 2, snapshot: { version: 2, items: [], totals: {} }, items: [] };
+  const prisma = {
+    session: { findUnique: async () => ({ id: 'session-1', userId: 'owner', organizationId: 'org-1', expiresAt: new Date(Date.now() + 60_000), user: { id: 'owner' }, organization: { id: 'org-1' } }) },
+    membership: { findUnique: async () => ({ role: 'OWNER' }) },
+    quote: { findFirst: async () => quote },
+    attachment: {
+      findFirst: async () => existing,
+      findUnique: async () => existing,
+      upsert: async ({ create }) => { archives++; existing = create; return create; }
+    },
+    auditLog: { create: async () => ({}) }
+  };
+  const handler = createHandler({
+    readConfig: () => ({ ...config, storage: { enabled: true, provider: 's3' }, pdf: {} }),
+    getPrisma: async () => prisma,
+    pdfProvider: async () => { renders++; return Buffer.from('%PDF-test'); },
+    storageProvider: () => ({
+      put: async () => { uploads++; },
+      get: async () => Buffer.from('%PDF-test')
+    })
+  });
+  const event = { path: '/api/quotes/quote1/pdf', httpMethod: 'GET', headers: { cookie: 'qf_session=' + token } };
+  assert.equal((await handler(event)).statusCode, 200);
+  assert.equal((await handler(event)).statusCode, 200);
+  assert.equal(archives, 1);
+  assert.equal(uploads, 1);
+  assert.equal(renders, 1);
 });
