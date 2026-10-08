@@ -8,6 +8,8 @@ test('paid entitlements follow authoritative subscription status and grace perio
   assert.equal(effectivePlan({ plan: 'BUSINESS', status: 'TRIALING' }, now), 'BUSINESS');
   assert.equal(effectivePlan({ plan: 'PRO', status: 'PAST_DUE', currentPeriodEnd: new Date('2026-10-03T00:00:00Z') }, now), 'PRO');
   assert.equal(effectivePlan({ plan: 'PRO', status: 'PAST_DUE', currentPeriodEnd: new Date('2026-09-30T00:00:00Z') }, now), 'FREE');
+  assert.equal(effectivePlan({ plan: 'PRO', status: 'PAST_DUE' }, now), 'FREE');
+  assert.equal(effectivePlan({ plan: 'BUSINESS', status: 'PAST_DUE', currentPeriodEnd: 'invalid' }, now), 'FREE');
   for (const status of ['UNPAID', 'INCOMPLETE', 'CANCELED']) assert.equal(effectivePlan({ plan: 'BUSINESS', status }, now), 'FREE');
 });
 
