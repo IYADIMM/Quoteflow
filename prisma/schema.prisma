@@ -359,6 +359,7 @@ model Subscription {
   canceledAt DateTime?
   trialEnd DateTime?
   lastStripeSyncAt DateTime?
+  lastStripeEventAt DateTime?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   organization Organization @relation(fields:[organizationId], references:[id], onDelete:Cascade)

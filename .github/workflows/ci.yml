@@ -25,6 +25,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm run db:validate
       - run: pnpm run db:generate
+      - run: node --check app.js && node --check netlify/functions/api.mjs
       - run: pnpm test
       - run: pnpm run build
       - run: pnpm audit --prod --audit-level=high

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomBytes, scryptSync } from 'node:crypto';
-import { createHandler, reserveAIUsage } from '../netlify/functions/api.mjs';
+import { createHandler, reserveAIUsage, sanitizedRequestPath } from '../netlify/functions/api.mjs';
 
 const config = { production: false, appUrl: 'https://quoteflow.test', databaseUrl: 'postgres://test', ai: { enabled: true, configured: true, apiKey: 'test-only', model: 'gemini-test', maxRequestsPerMinute: 5, maxInputChars: 2000, monthlyLimits: { FREE: 25, PRO: 500, BUSINESS: 5000 } }, email: { provider: '', apiKey: '', from: '' } };
 const response = async event => {
@@ -185,9 +185,9 @@ test('Stripe webhooks verify signatures, persist subscription state and ignore d
   const billingConfig = { ...config, stripe: { enabled: true, secretKey: 'sk_test', webhookSecret: 'whsec_test', prices: { PRO: 'price_pro', BUSINESS: 'price_business' } }, storage: { enabled: false }, pdf: {} };
   const stripeEvent = { id: 'evt_1', type: 'customer.subscription.updated', livemode: false, data: { object: { id: 'sub_1', customer: 'cus_1', status: 'active', current_period_start: 10, current_period_end: 20, metadata: { quoteflowOrganizationId: 'org-1' }, items: { data: [{ price: { id: 'price_pro', product: 'prod_1' } }] } } } };
   let storedSubscription, signatureCalls = 0;
-  const tx = { stripeEvent: { create: async ({ data }) => { assert.equal(data.id, 'evt_1'); } }, subscription: { upsert: async ({ create }) => { storedSubscription = create; } }, auditLog: { create: async () => ({}) } };
+  const tx = { stripeEvent: { create: async ({ data }) => { assert.equal(data.id, 'evt_1'); } }, subscription: { findUnique: async () => null, create: async ({ data }) => { storedSubscription = data; } }, auditLog: { create: async () => ({}) } };
   const prisma = { $transaction: async fn => fn(tx) };
-  const provider = () => ({ constructEvent: async (payload, signature) => { signatureCalls++; assert.equal(payload, '{"event":true}'); assert.equal(signature, 'valid-signature'); return stripeEvent; } });
+  const provider = () => ({ constructEvent: async (payload, signature) => { signatureCalls++; assert.equal(payload, '{"event":true}'); assert.equal(signature, 'valid-signature'); return stripeEvent; }, retrieveSubscription: async id => { assert.equal(id, 'sub_1'); return stripeEvent.data.object; } });
   const handler = createHandler({ readConfig: () => billingConfig, getPrisma: async () => prisma, billingProvider: provider });
   const result = await handler({ path: '/api/stripe/webhook', httpMethod: 'POST', headers: { 'stripe-signature': 'valid-signature' }, body: '{"event":true}' });
   assert.equal(result.statusCode, 200);
@@ -313,4 +313,102 @@ test('account deletion refuses a sole organization owner', async () => {
   const result = await handler({ path: '/api/account', httpMethod: 'DELETE', headers: { cookie: `qf_session=${sessionToken}; qf_csrf=csrf`, 'x-csrf-token': 'csrf', origin: config.appUrl }, body: JSON.stringify({ currentPassword: password, confirm: 'DELETE MY ACCOUNT' }) });
   assert.equal(result.statusCode, 409);
   assert.match(JSON.parse(result.body).error, /Transfer ownership/);
+});
+
+test('customer maintenance is tenant-scoped and archival preserves historical data', async () => {
+  const token = 'customer-edit-session', customer = { id: 'cust-1', organizationId: 'org-1', companyName: 'Old Name', email: 'old@example.test', deletedAt: null };
+  let auditCount = 0;
+  const prisma = {
+    session: { findUnique: async () => ({ id: 'session-1', userId: 'owner', organizationId: 'org-1', expiresAt: new Date(Date.now() + 60_000), user: { id: 'owner', emailVerifiedAt: new Date() }, organization: { id: 'org-1' } }) },
+    membership: { findUnique: async () => ({ role: 'OWNER' }) },
+    customer: {
+      findFirst: async ({ where }) => where.organizationId === 'org-1' && where.id === customer.id && !customer.deletedAt ? customer : null,
+      update: async ({ data }) => Object.assign(customer, data),
+      updateMany: async ({ data }) => { Object.assign(customer, data); return { count: 1 }; }
+    },
+    auditLog: { create: async () => { auditCount++; return {}; } }
+  };
+  const handler = createHandler({ readConfig: () => config, getPrisma: async () => prisma });
+  const call = (path, method, body = {}) => handler({ path: '/api' + path, httpMethod: method, headers: { origin: config.appUrl, cookie: 'qf_session=' + token + '; qf_csrf=csrf', 'x-csrf-token': 'csrf' }, body: JSON.stringify(body) });
+  assert.equal((await call('/customers/not-ours', 'PATCH', { companyName: 'Tamper' })).statusCode, 404);
+  assert.equal((await call('/customers/cust-1', 'PATCH', { email: 'not-an-email' })).statusCode, 400);
+  const edited = await call('/customers/cust-1', 'PATCH', { companyName: 'Updated Trading', email: 'sales@example.test' });
+  assert.equal(edited.statusCode, 200);
+  assert.equal(customer.companyName, 'Updated Trading');
+  assert.equal((await call('/customers/cust-1', 'DELETE')).statusCode, 200);
+  assert.ok(customer.deletedAt instanceof Date);
+  assert.equal((await call('/customers/cust-1', 'PATCH', { companyName: 'Nope' })).statusCode, 404);
+  assert.equal(auditCount, 2);
+});
+
+test('customer bearer link tokens are redacted before request logging', () => {
+  assert.equal(sanitizedRequestPath('/api/public/quote/secret-token/pdf'), '/api/public/quote/[redacted]/pdf');
+  assert.equal(sanitizedRequestPath('/q/secret-token'), '/q/[redacted]');
+  assert.equal(sanitizedRequestPath('/api/quotes/ordinary-id/pdf'), '/api/quotes/ordinary-id/pdf');
+});
+
+test('authenticated PDF downloads reuse archived private PDF rather than allocating copies', async () => {
+  const token = 'pdf-session'; let archives = 0, renders = 0, uploads = 0, existing = null;
+  const quote = { id: 'quote1', number: 'Q-1', organizationId: 'org-1', status: 'SENT', version: 2, snapshot: { version: 2, items: [], totals: {} }, items: [] };
+  const prisma = {
+    session: { findUnique: async () => ({ id: 'session-1', userId: 'owner', organizationId: 'org-1', expiresAt: new Date(Date.now() + 60_000), user: { id: 'owner' }, organization: { id: 'org-1' } }) },
+    membership: { findUnique: async () => ({ role: 'OWNER' }) },
+    quote: { findFirst: async () => quote },
+    attachment: {
+      findFirst: async () => existing,
+      findUnique: async () => existing,
+      upsert: async ({ create }) => { archives++; existing = create; return create; }
+    },
+    auditLog: { create: async () => ({}) }
+  };
+  const handler = createHandler({
+    readConfig: () => ({ ...config, storage: { enabled: true, provider: 's3' }, pdf: {} }),
+    getPrisma: async () => prisma,
+    pdfProvider: async () => { renders++; return Buffer.from('%PDF-test'); },
+    storageProvider: () => ({
+      put: async () => { uploads++; },
+      get: async () => Buffer.from('%PDF-test')
+    })
+  });
+  const event = { path: '/api/quotes/quote1/pdf', httpMethod: 'GET', headers: { cookie: 'qf_session=' + token } };
+  assert.equal((await handler(event)).statusCode, 200);
+  assert.equal((await handler(event)).statusCode, 200);
+  assert.equal(archives, 1);
+  assert.equal(uploads, 1);
+  assert.equal(renders, 1);
+});
+
+test('late Stripe events cannot overwrite newer reconciled subscription state', async () => {
+  const billingConfig = { ...config, stripe: { enabled: true, secretKey: 'sk_test', webhookSecret: 'whsec_test', prices: { PRO: 'price_pro' } } };
+  const current = { id: 'sub-1', customer: 'cus-1', status: 'active', metadata: { quoteflowOrganizationId: 'org-1' }, items: { data: [{ price: { id: 'price_pro', product: 'prod-pro' } }] } };
+  const events = [
+    { id: 'evt-new', created: 200, livemode: false, type: 'customer.subscription.updated', data: { object: current } },
+    { id: 'evt-old', created: 100, livemode: false, type: 'customer.subscription.deleted', data: { object: { ...current, status: 'canceled' } } }
+  ];
+  let stored = null, auditCount = 0, retrieved = 0;
+  const tx = {
+    stripeEvent: { create: async () => ({}) },
+    subscription: {
+      findUnique: async () => stored,
+      create: async ({ data }) => { stored = data; return stored; },
+      updateMany: async ({ data }) => { stored = { ...stored, ...data }; return { count: 1 }; }
+    },
+    auditLog: { create: async () => { auditCount++; } }
+  };
+  const handler = createHandler({
+    readConfig: () => billingConfig,
+    getPrisma: async () => ({ $transaction: async fn => fn(tx) }),
+    billingProvider: () => ({
+      constructEvent: async () => events.shift(),
+      retrieveSubscription: async id => { assert.equal(id, 'sub-1'); retrieved++; return current; }
+    })
+  });
+  const event = { path: '/api/stripe/webhook', httpMethod: 'POST', headers: { 'stripe-signature': 'signature' }, body: '{"event":1}' };
+  assert.equal((await handler(event)).statusCode, 200);
+  assert.equal(stored.status, 'ACTIVE');
+  assert.equal((await handler(event)).statusCode, 200);
+  assert.equal(stored.status, 'ACTIVE');
+  assert.equal(stored.lastStripeEventAt.getTime(), 200000);
+  assert.equal(auditCount, 1);
+  assert.equal(retrieved, 2);
 });

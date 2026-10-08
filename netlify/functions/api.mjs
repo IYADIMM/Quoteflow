@@ -5,6 +5,7 @@ import { getPrisma } from '../../lib/prisma.mjs';
 import { GeminiProvider } from '../../lib/ai-provider.mjs';
 import { createEmailProvider } from '../../lib/email-provider.mjs';
 import { calculateQuote } from '../../lib/pricing.mjs';
+import { evaluateQuotePolicy } from '../../lib/commercial-policy.mjs';
 import { amountScaled, normalizeQuoteLines, quoteItemData, validCurrency } from '../../lib/quote-lines.mjs';
 import { StripeBillingProvider, stripePayloadHash, subscriptionRecord } from '../../lib/billing-provider.mjs';
 import { entitlementsFor } from '../../lib/entitlements.mjs';
@@ -24,6 +25,11 @@ const json = (statusCode, body, headers = {}) => {
 };
 const binary = (statusCode, body, contentType, fileName) => ({ statusCode, isBase64Encoded: true, headers: { 'content-type': contentType, 'content-disposition': `attachment; filename="${String(fileName).replace(/[^a-zA-Z0-9_.-]/g, '_')}"`, 'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' }, body: body.toString('base64') });
 const requireVerifiedEmail = user => user?.emailVerifiedAt ? null : json(403, { error: 'Verify your email before performing this action.', code: 'EMAIL_VERIFICATION_REQUIRED' });
+/** Never put customer bearer tokens into logs, monitoring or traces. */
+export const sanitizedRequestPath = path => String(path || '')
+  .replace(/\/api\/public\/quote\/[^/]+/g, '/api/public/quote/[redacted]')
+  .replace(/\/public\/quote\/[^/]+/g, '/public/quote/[redacted]')
+  .replace(/\/q\/[^/]+/g, '/q/[redacted]');
 async function passwordMatches(user, password) {
   if (typeof password !== 'string' || password.length > 256) return false;
   const [saltHex, expectedHex] = String(user?.passwordHash || '').split(':'), expected = Buffer.from(expectedHex || '', 'hex');
@@ -67,6 +73,14 @@ const authCookies = (sessionToken, production) => {
   const secure = production ? '; Secure' : '';
   return [`qf_session=${sessionToken}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${secure}`, `qf_csrf=${csrfToken}; SameSite=Lax; Path=/; Max-Age=2592000${secure}`];
 };
+
+async function teamHasCapacity(tx, organizationId) {
+  const [subscription, members] = await Promise.all([
+    tx.subscription.findUnique({ where: { organizationId } }),
+    tx.membership.count({ where: { organizationId } })
+  ]);
+  return members < entitlementsFor(subscription, { teamMembers: members }).limits.teamMembers;
+}
 
 export async function reserveAIUsage(prisma, organizationId, feature, config, ip) {
   const minuteAgo = new Date(Date.now() - 60_000);
@@ -126,42 +140,69 @@ export function createHandler(dependencies = {}) {
 
   if (path === '/client-error' && method === 'POST') {
     const limited = await throttle('client-error', requestIp, 10, 300); if (limited) return limited;
-    const monitor = makeMonitor(config); if (monitor) await monitor.capture({ event: 'frontend_exception', message: String(body.message || '').slice(0, 500), path: String(body.path || '').slice(0, 300), provider: 'browser' }).catch(() => {});
+    const monitor = makeMonitor(config); if (monitor) await monitor.capture({ event: 'frontend_exception', message: String(body.message || '').slice(0, 500), path: sanitizedRequestPath(String(body.path || '').slice(0, 300)), provider: 'browser' }).catch(() => {});
     return json(202, { received: true });
   }
 
   if (path === '/stripe/webhook' && method === 'POST') {
     if (!config.stripe.enabled) return json(404, { error: 'Billing webhook is disabled.' });
+    const billing = makeBilling(config);
     let stripeEvent;
-    try { stripeEvent = await makeBilling(config).constructEvent(event.body || '', event.headers['stripe-signature'] || event.headers['Stripe-Signature'] || ''); }
+    try { stripeEvent = await billing.constructEvent(event.body || '', event.headers['stripe-signature'] || event.headers['Stripe-Signature'] || ''); }
     catch (error) { console.error('stripe_webhook_rejected', { message: error.message }); return json(400, { error: 'Stripe signature verification failed.' }); }
     const object = stripeEvent.data?.object || {}, eventHash = stripePayloadHash(event.body || '');
     const metadataOrganizationId = object.metadata?.quoteflowOrganizationId || object.client_reference_id || object.subscription_details?.metadata?.quoteflowOrganizationId || null;
+    const isSubscriptionEvent = stripeEvent.type.startsWith('customer.subscription.');
+    const isInvoiceEvent = ['invoice.payment_failed', 'invoice.paid', 'invoice.payment_succeeded', 'payment_intent.payment_failed'].includes(stripeEvent.type);
+    const subscriptionId = isSubscriptionEvent ? object.id
+      : stripeEvent.type === 'checkout.session.completed' ? (typeof object.subscription === 'string' ? object.subscription : object.subscription?.id)
+      : isInvoiceEvent ? (typeof object.subscription === 'string' ? object.subscription : object.parent?.subscription_details?.subscription || null)
+      : null;
+    // Stripe webhook payloads are historical snapshots. Always reconcile the
+    // CURRENT subscription rather than letting late invoice/subscription events
+    // overwrite newer paid, canceled or past-due state.
+    let currentSubscription = null;
+    if (subscriptionId && (isSubscriptionEvent || isInvoiceEvent || stripeEvent.type === 'checkout.session.completed')) {
+      try { currentSubscription = await billing.retrieveSubscription(subscriptionId); }
+      catch (error) { console.error('stripe_subscription_reconcile_failed', { eventId: stripeEvent.id, message: error.message }); return json(503, { error: 'Billing state could not be reconciled. Stripe may retry.' }); }
+    }
+    const eventAt = Number.isInteger(stripeEvent.created) && stripeEvent.created > 0 ? new Date(stripeEvent.created * 1000) : null;
     try {
       await prisma.$transaction(async tx => {
         await tx.stripeEvent.create({ data: { id: stripeEvent.id, organizationId: metadataOrganizationId, type: stripeEvent.type, livemode: Boolean(stripeEvent.livemode), payloadHash: eventHash } });
-        if (stripeEvent.type === 'checkout.session.completed' && metadataOrganizationId) {
-          await tx.subscription.upsert({ where: { organizationId: metadataOrganizationId }, create: { organizationId: metadataOrganizationId, plan: String(object.metadata?.plan || 'FREE').toUpperCase(), status: 'INCOMPLETE', stripeCustomerId: typeof object.customer === 'string' ? object.customer : object.customer?.id || null, stripeSubscriptionId: typeof object.subscription === 'string' ? object.subscription : object.subscription?.id || null, lastStripeSyncAt: new Date() }, update: { stripeCustomerId: typeof object.customer === 'string' ? object.customer : object.customer?.id || undefined, stripeSubscriptionId: typeof object.subscription === 'string' ? object.subscription : object.subscription?.id || undefined, lastStripeSyncAt: new Date() } });
-        }
-        if (stripeEvent.type.startsWith('customer.subscription.')) {
-          let organizationId = metadataOrganizationId;
-          if (!organizationId) organizationId = (await tx.subscription.findFirst({ where: { OR: [{ stripeSubscriptionId: object.id }, { stripeCustomerId: typeof object.customer === 'string' ? object.customer : object.customer?.id }] }, select: { organizationId: true } }))?.organizationId;
+        if (currentSubscription) {
+          let organizationId = currentSubscription.metadata?.quoteflowOrganizationId || metadataOrganizationId;
+          const customerId = typeof currentSubscription.customer === 'string' ? currentSubscription.customer : currentSubscription.customer?.id;
+          if (!organizationId) organizationId = (await tx.subscription.findFirst({ where: { OR: [{ stripeSubscriptionId: currentSubscription.id }, { stripeCustomerId: customerId }] }, select: { organizationId: true } }))?.organizationId;
           if (!organizationId) throw new Error('Stripe subscription is not linked to a QuoteFlow organization.');
-          await tx.subscription.upsert({ where: { organizationId }, create: { organizationId, ...subscriptionRecord(object, config.stripe.prices) }, update: subscriptionRecord(object, config.stripe.prices) });
-          await tx.auditLog.create({ data: { organizationId, action: `billing.${stripeEvent.type}`, objectType: 'Subscription', objectId: object.id, metadata: { status: object.status, priceId: object.items?.data?.[0]?.price?.id || null } } });
+          const stored = await tx.subscription.findUnique({ where: { organizationId } });
+          if (eventAt && stored?.lastStripeEventAt && stored.lastStripeEventAt > eventAt) return;
+          const next = { ...subscriptionRecord(currentSubscription, config.stripe.prices), ...(eventAt ? { lastStripeEventAt: eventAt } : {}) };
+          if (stored) {
+            const updated = await tx.subscription.updateMany({
+              where: { organizationId, ...(eventAt ? { OR: [{ lastStripeEventAt: null }, { lastStripeEventAt: { lte: eventAt } }] } : {}) },
+              data: next
+            });
+            if (!updated.count) return;
+          } else {
+            await tx.subscription.create({ data: { organizationId, ...next } });
+          }
+          await tx.auditLog.create({ data: { organizationId, action: `billing.${stripeEvent.type}`, objectType: 'Subscription', objectId: currentSubscription.id, metadata: { status: currentSubscription.status, priceId: currentSubscription.items?.data?.[0]?.price?.id || null } } });
+        } else if (stripeEvent.type === 'checkout.session.completed' && metadataOrganizationId) {
+          // Preserve an existing paid state; Checkout never grants entitlements
+          // until Stripe's actual subscription status has been reconciled.
+          await tx.subscription.upsert({
+            where: { organizationId: metadataOrganizationId },
+            create: { organizationId: metadataOrganizationId, plan: 'FREE', status: 'INCOMPLETE', stripeCustomerId: typeof object.customer === 'string' ? object.customer : object.customer?.id || null, stripeSubscriptionId: typeof object.subscription === 'string' ? object.subscription : object.subscription?.id || null },
+            update: { stripeCustomerId: typeof object.customer === 'string' ? object.customer : object.customer?.id || undefined }
+          });
         }
-        if (['invoice.payment_failed', 'payment_intent.payment_failed'].includes(stripeEvent.type)) {
-          const customerId = typeof object.customer === 'string' ? object.customer : object.customer?.id;
-          const subscription = customerId ? await tx.subscription.findFirst({ where: { stripeCustomerId: customerId } }) : null;
-          if (subscription) { await tx.subscription.update({ where: { organizationId: subscription.organizationId }, data: { status: 'PAST_DUE', lastStripeSyncAt: new Date() } }); await tx.auditLog.create({ data: { organizationId: subscription.organizationId, action: 'billing.payment_failed', objectType: 'Subscription', objectId: subscription.id } }); }
-        }
-        if (['invoice.paid', 'invoice.payment_succeeded'].includes(stripeEvent.type)) {
-          const customerId = typeof object.customer === 'string' ? object.customer : object.customer?.id;
-          const subscription = customerId ? await tx.subscription.findFirst({ where: { stripeCustomerId: customerId } }) : null;
-          if (subscription && subscription.status === 'PAST_DUE') await tx.subscription.update({ where: { organizationId: subscription.organizationId }, data: { status: 'ACTIVE', lastStripeSyncAt: new Date() } });
-        }
-      });
-    } catch (error) { if (error.code === 'P2002') return json(200, { received: true, duplicate: true }); console.error('stripe_webhook_processing_failed', { eventId: stripeEvent.id, type: stripeEvent.type, message: error.message }); return json(500, { error: 'Webhook processing failed and may be retried.' }); }
+      }, { isolationLevel: 'Serializable' });
+    } catch (error) {
+      if (error.code === 'P2002') return json(200, { received: true, duplicate: true });
+      console.error('stripe_webhook_processing_failed', { eventId: stripeEvent.id, type: stripeEvent.type, message: error.message });
+      return json(500, { error: 'Webhook processing failed and may be retried.' });
+    }
     return json(200, { received: true });
   }
 
@@ -184,6 +225,7 @@ export function createHandler(dependencies = {}) {
           const claimed = await tx.invitation.updateMany({ where: { id: invitation.id, acceptedAt: null, expiresAt: { gt: new Date() } }, data: { acceptedAt: new Date() } });
           if (!claimed.count) throw new Error('INVITATION_CLAIMED');
           organization = invitation.organization; memberRole = invitation.role;
+          if (!await teamHasCapacity(tx, organization.id)) throw new Error('TEAM_LIMIT');
           await tx.membership.create({ data: { userId: user.id, organizationId: organization.id, role: memberRole } });
         } else {
           organization = await tx.organization.create({ data: { name: organizationName, settings: { create: { data: { company: organizationName, currency: 'AED', tax: 5, margin: 20, validity: 30 } } }, subscription: { create: { plan: 'FREE', status: 'ACTIVE' } } } });
@@ -191,7 +233,7 @@ export function createHandler(dependencies = {}) {
         }
         await tx.session.create({ data: { tokenHash: sha256(sessionToken), userId: user.id, organizationId: organization.id, expiresAt: new Date(Date.now() + 30 * 864e5) } });
         return { user, organization, memberRole };
-      });
+      }, { isolationLevel: 'Serializable' });
       const emailProvider = makeEmail(config);
       let verificationSent = false;
       if (emailProvider) {
@@ -201,7 +243,7 @@ export function createHandler(dependencies = {}) {
         catch (error) { console.error('verification_email_failed', { userId: result.user.id, message: error.message }); }
       }
       return json(201, { user: { id: result.user.id, email }, organization: { id: result.organization.id, name: result.organization.name }, role: result.memberRole, onboardingRequired: !invitation, verificationSent }, { 'set-cookie': authCookies(sessionToken, config.production) });
-    } catch (error) { if (error.code === 'P2002') return json(409, { error: 'An account already exists for this email.' }); if (error.message === 'INVITATION_CLAIMED') return json(409, { error: 'This invitation was already accepted.' }); throw error; }
+    } catch (error) { if (error.code === 'P2002') return json(409, { error: 'An account already exists for this email.' }); if (error.message === 'INVITATION_CLAIMED') return json(409, { error: 'This invitation was already accepted.' }); if (error.message === 'TEAM_LIMIT') return json(402, { error: 'The organization team-member limit has been reached.' }); if (error.code === 'P2034') return json(409, { error: 'Concurrent signup detected. Retry your invitation.' }); throw error; }
   }
   if (path === '/auth/login' && method === 'POST') {
     const email = String(body.email || '').trim().toLowerCase();
@@ -409,8 +451,36 @@ export function createHandler(dependencies = {}) {
   if (quotePdfMatch && method === 'GET') {
     const quote = await prisma.quote.findFirst({ where: { id: quotePdfMatch[1], organizationId: organization.id, deletedAt: null }, include: { items: { orderBy: { sortOrder: 'asc' } } } });
     if (!quote || !quote.snapshot || !['SENT', 'VIEWED', 'ACCEPTED', 'REJECTED'].includes(quote.status)) return json(409, { error: 'Save and send the quote before generating its immutable customer PDF.' });
-    const pdf = await makePdf(quote, config.pdf); const fileName = `${quote.number}-v${quote.snapshot.version || quote.version}.pdf`;
-    if (config.storage.enabled) { const storage = makeStorage(config), key = storageKey(organization.id, '.pdf', 'generated-quotes'); await storage.put({ key, body: pdf, mimeType: 'application/pdf' }); await prisma.attachment.upsert({ where: { organizationId_storageKey: { organizationId: organization.id, storageKey: key } }, create: { organizationId: organization.id, quoteId: quote.id, storageKey: key, kind: 'QUOTE_PDF', status: 'READY', provider: config.storage.provider, fileName, mimeType: 'application/pdf', byteSize: pdf.length, sha256: sha256(pdf) }, update: { status: 'READY', byteSize: pdf.length, sha256: sha256(pdf) } }).catch(async () => prisma.attachment.create({ data: { organizationId: organization.id, quoteId: quote.id, storageKey: key, kind: 'QUOTE_PDF', status: 'READY', provider: config.storage.provider, fileName, mimeType: 'application/pdf', byteSize: pdf.length, sha256: sha256(pdf) } })); }
+    const version = quote.snapshot.version || quote.version;
+    const fileName = `${quote.number}-v${version}.pdf`;
+    let pdf;
+    if (config.storage.enabled) {
+      const storage = makeStorage(config);
+      // Immutable snapshot -> one canonical archive per revision. Reuse legacy
+      // archived PDFs too, rather than creating more copies on every download.
+      const archived = await prisma.attachment.findFirst({ where: { organizationId: organization.id, quoteId: quote.id, kind: 'QUOTE_PDF', fileName, status: 'READY', deletedAt: null }, orderBy: { createdAt: 'asc' } });
+      if (archived) {
+        pdf = await storage.get(archived.storageKey);
+      } else {
+        pdf = await makePdf(quote, config.pdf);
+        const key = `${organization.id}/generated-quotes/${quote.id}/v${version}.pdf`;
+        const existingKey = await prisma.attachment.findUnique({ where: { organizationId_storageKey: { organizationId: organization.id, storageKey: key } } });
+        if (existingKey?.status === 'READY' && !existingKey.deletedAt) {
+          pdf = await storage.get(key);
+        } else {
+          // Concurrent first downloads share the same object key and unique
+          // database attachment; no new keys or quota usage per download.
+          await storage.put({ key, body: pdf, mimeType: 'application/pdf' });
+          await prisma.attachment.upsert({
+            where: { organizationId_storageKey: { organizationId: organization.id, storageKey: key } },
+            create: { organizationId: organization.id, quoteId: quote.id, storageKey: key, kind: 'QUOTE_PDF', status: 'READY', provider: config.storage.provider, fileName, mimeType: 'application/pdf', byteSize: pdf.length, sha256: sha256(pdf) },
+            update: { status: 'READY', deletedAt: null, byteSize: pdf.length, sha256: sha256(pdf) }
+          });
+        }
+      }
+    } else {
+      pdf = await makePdf(quote, config.pdf);
+    }
     await prisma.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'quote.pdf_generated', objectType: 'Quote', objectId: quote.id, metadata: { version: quote.snapshot.version || quote.version } } });
     return binary(200, pdf, 'application/pdf', fileName);
   }
@@ -420,10 +490,30 @@ export function createHandler(dependencies = {}) {
     if (!config.storage.enabled) return json(503, { error: 'Object storage is not configured.' });
     let file; try { file = validateUpload(body, config.storage.maxUploadBytes); } catch (error) { return json(400, { error: error.message }); }
     const rfqId = body.rfqId ? String(body.rfqId) : null; if (rfqId && !await prisma.rFQ.findFirst({ where: { id: rfqId, organizationId: organization.id, deletedAt: null } })) return json(404, { error: 'RFQ not found.' });
-    const subscription = await prisma.subscription.findUnique({ where: { organizationId: organization.id } }), used = await prisma.attachment.aggregate({ where: { organizationId: organization.id, deletedAt: null }, _sum: { byteSize: true } }), entitlement = entitlementsFor(subscription, { storageBytes: used._sum.byteSize || 0 });
-    if (file.byteSize > entitlement.available.storageBytes) return json(402, { error: 'Organization storage quota would be exceeded.' });
-    const key = storageKey(organization.id, file.extension), attachment = await prisma.attachment.create({ data: { organizationId: organization.id, rfqId, storageKey: key, provider: config.storage.provider, fileName: file.fileName, mimeType: file.mimeType, byteSize: file.byteSize, sha256: /^[a-f0-9]{64}$/i.test(body.sha256 || '') ? body.sha256.toLowerCase() : 'pending' } });
-    const uploadUrl = await makeStorage(config).createUploadUrl({ key, mimeType: file.mimeType, byteSize: file.byteSize }); return json(201, { attachment: { id: attachment.id, fileName: attachment.fileName, status: attachment.status }, uploadUrl, expiresIn: 900 });
+    const key = storageKey(organization.id, file.extension);
+    let attachment;
+    try {
+      attachment = await prisma.$transaction(async tx => {
+        const [subscription, used] = await Promise.all([
+          tx.subscription.findUnique({ where: { organizationId: organization.id } }),
+          tx.attachment.aggregate({ where: { organizationId: organization.id, deletedAt: null }, _sum: { byteSize: true } })
+        ]);
+        if (file.byteSize > entitlementsFor(subscription, { storageBytes: used._sum.byteSize || 0 }).available.storageBytes) return null;
+        // PENDING reservations count towards quota to stop concurrent uploads.
+        return tx.attachment.create({ data: { organizationId: organization.id, rfqId, storageKey: key, provider: config.storage.provider, fileName: file.fileName, mimeType: file.mimeType, byteSize: file.byteSize, sha256: /^[a-f0-9]{64}$/i.test(body.sha256 || '') ? body.sha256.toLowerCase() : 'pending' } });
+      }, { isolationLevel: 'Serializable' });
+    } catch (error) {
+      if (error.code === 'P2034') return json(409, { error: 'A concurrent storage reservation is in progress. Please retry.' });
+      throw error;
+    }
+    if (!attachment) return json(402, { error: 'Organization storage quota would be exceeded.' });
+    try {
+      const uploadUrl = await makeStorage(config).createUploadUrl({ key, mimeType: file.mimeType, byteSize: file.byteSize });
+      return json(201, { attachment: { id: attachment.id, fileName: attachment.fileName, status: attachment.status }, uploadUrl, expiresIn: 900 });
+    } catch (error) {
+      await prisma.attachment.update({ where: { id: attachment.id }, data: { status: 'REJECTED', deletedAt: new Date() } }).catch(() => {});
+      return json(503, { error: 'A private upload could not be prepared. Retry later.' });
+    }
   }
   const attachmentMatch = /^\/attachments\/([^/]+)(?:\/(complete|download))?$/.exec(path);
   if (attachmentMatch) {
@@ -500,6 +590,41 @@ export function createHandler(dependencies = {}) {
     const item = await prisma.customer.create({ data: { organizationId: organization.id, companyName, contactName: String(body.contactName || body.contact || '').slice(0, 160) || null, email: String(body.email || '').slice(0, 254) || null, phone: String(body.phone || '').slice(0, 60) || null, address: String(body.address || '').slice(0, 1000) || null, industry: String(body.industry || '').slice(0, 100) || null, notes: String(body.notes || '').slice(0, 2000) || null } });
     await prisma.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'customer.created', objectType: 'Customer', objectId: item.id } });
     return json(201, { item: { ...item, name: item.companyName, contact: item.contactName } });
+  }
+  const customerMatch = /^\/customers\/([^/]+)$/.exec(path);
+  if (customerMatch && ['PATCH', 'DELETE'].includes(method)) {
+    if (!['OWNER', 'ADMIN', 'SALES_MANAGER', 'SALES_REP'].includes(role)) return json(403, { error: 'Read-only role.' });
+    const existing = await prisma.customer.findFirst({ where: { id: customerMatch[1], organizationId: organization.id, deletedAt: null } });
+    if (!existing) return json(404, { error: 'Customer not found in this organization.' });
+    if (method === 'DELETE') {
+      const archived = await prisma.customer.updateMany({ where: { id: existing.id, organizationId: organization.id, deletedAt: null }, data: { deletedAt: new Date() } });
+      if (!archived.count) return json(409, { error: 'This customer has already been archived.' });
+      await prisma.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'customer.archived', objectType: 'Customer', objectId: existing.id } });
+      return json(200, { archived: true });
+    }
+    const fields = {
+      companyName: ['companyName', 'name', 200],
+      contactName: ['contactName', 'contact', 160],
+      email: ['email', null, 254],
+      phone: ['phone', null, 60],
+      address: ['address', null, 1000],
+      industry: ['industry', null, 100],
+      notes: ['notes', null, 2000]
+    };
+    const data = {};
+    for (const [column, [source, alias, maxLength]] of Object.entries(fields)) {
+      if (!Object.prototype.hasOwnProperty.call(body, source) && !(alias && Object.prototype.hasOwnProperty.call(body, alias))) continue;
+      const value = body[source] ?? (alias ? body[alias] : null);
+      if (value !== null && typeof value !== 'string') return json(400, { error: 'Customer fields must contain text.' });
+      const clean = (value || '').trim();
+      if (clean.length > maxLength || (column === 'companyName' && !clean)) return json(400, { error: 'Customer information is missing or too long.' });
+      if (column === 'email' && clean && !/^\S+@\S+\.\S+$/.test(clean)) return json(400, { error: 'Customer email is invalid.' });
+      data[column] = clean || null;
+    }
+    if (!Object.keys(data).length) return json(400, { error: 'No editable customer fields were provided.' });
+    const item = await prisma.customer.update({ where: { id: existing.id }, data });
+    await prisma.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'customer.updated', objectType: 'Customer', objectId: item.id, metadata: { fields: Object.keys(data) } } });
+    return json(200, { item: { ...item, name: item.companyName, contact: item.contactName } });
   }
   if (path === '/products' && method === 'GET') {
     const items = await prisma.catalogItem.findMany({ where: { organizationId: organization.id, deletedAt: null }, orderBy: { createdAt: 'desc' } });
@@ -649,12 +774,15 @@ export function createHandler(dependencies = {}) {
       await prisma.$transaction(async tx => {
         const claimed = await tx.invitation.updateMany({ where: { id: invitation.id, acceptedAt: null, expiresAt: { gt: new Date() } }, data: { acceptedAt: new Date() } });
         if (!claimed.count) throw new Error('INVITATION_CLAIMED');
+        if (!await teamHasCapacity(tx, invitation.organizationId)) throw new Error('TEAM_LIMIT');
         await tx.membership.create({ data: { userId: user.id, organizationId: invitation.organizationId, role: invitation.role } });
         await tx.auditLog.create({ data: { organizationId: invitation.organizationId, actorUserId: user.id, action: 'team.invitation.accepted', objectType: 'Invitation', objectId: invitation.id } });
         await tx.session.update({ where: { id: principal.session.id }, data: { organizationId: invitation.organizationId } });
-      });
+      }, { isolationLevel: 'Serializable' });
     } catch (error) {
       if (error.message === 'INVITATION_CLAIMED') return json(409, { error: 'This invitation was already accepted.' });
+      if (error.message === 'TEAM_LIMIT') return json(402, { error: 'The organization team-member limit has been reached.' });
+      if (error.code === 'P2034') return json(409, { error: 'Concurrent invitation acceptance detected. Retry.' });
       throw error;
     }
     return json(200, { organization: { id: invitation.organization.id, name: invitation.organization.name }, role: invitation.role });
@@ -757,9 +885,9 @@ export function createHandler(dependencies = {}) {
     const minimumMargin = Number(settings?.minMargin ?? settings?.data?.margin ?? 20);
     const marginMode = settings?.marginMode || settings?.data?.marginMode || 'WARNING';
     const belowMinimumPrice = lines.some(line => line.minimumPrice != null && amountScaled(line.price) < amountScaled(line.minimumPrice));
-    if (belowMinimumPrice && !(role === 'SALES_REP' && marginMode === 'APPROVAL_REQUIRED')) return json(409, { error: 'Selling price cannot be below the catalog minimum.' });
-    if (totals.margin < minimumMargin && marginMode === 'BLOCK') return json(409, { error: 'Quote is below the configured minimum margin.' });
-    const requiresApproval = (totals.margin < minimumMargin || belowMinimumPrice) && marginMode === 'APPROVAL_REQUIRED';
+    const policy = evaluateQuotePolicy({ margin: totals.margin, minimumMargin, marginMode, belowMinimumPrice, allowMinimumOverride: role === 'SALES_REP' });
+    if (policy.blockedReason) return json(409, { error: policy.blockedReason });
+    const requiresApproval = policy.requiresApproval;
     const status = requiresApproval ? 'INTERNAL_REVIEW' : 'DRAFT';
     const expiryDate = body.expiry ? new Date(`${body.expiry}T23:59:59.999Z`) : null;
     if (expiryDate && !Number.isFinite(expiryDate.getTime())) return json(400, { error: 'Quote expiry date is invalid.' });
@@ -778,20 +906,30 @@ export function createHandler(dependencies = {}) {
         return tx.quote.findUnique({ where: { id: prior.id }, include: { items: { orderBy: { sortOrder: 'asc' } } } });
       });
       if (!changed) return json(409, { error: 'This quote changed while you were saving. Reload and review the latest version.' });
-      return json(200, { item: quoteDTO(changed), totals, warning: totals.margin < minimumMargin && marginMode === 'WARNING' ? 'Quote is below the configured margin guideline.' : null });
+      return json(200, { item: quoteDTO(changed), totals, warning: policy.warning });
     }
     const monthStart = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1));
-    const [subscription, quoteCount] = await Promise.all([prisma.subscription.findUnique({ where: { organizationId: organization.id } }), prisma.quote.count({ where: { organizationId: organization.id, createdAt: { gte: monthStart }, deletedAt: null } })]);
-    if (quoteCount >= entitlementsFor(subscription, { quotesThisMonth: quoteCount }).limits.quotesPerMonth) return json(402, { error: 'Your plan monthly quotation limit has been reached.' });
-    const quote = await prisma.$transaction(async tx => {
+    let quote;
+    try {
+      quote = await prisma.$transaction(async tx => {
+      const [subscription, quoteCount] = await Promise.all([
+        tx.subscription.findUnique({ where: { organizationId: organization.id } }),
+        tx.quote.count({ where: { organizationId: organization.id, createdAt: { gte: monthStart }, deletedAt: null } })
+      ]);
+      if (quoteCount >= entitlementsFor(subscription, { quotesThisMonth: quoteCount }).limits.quotesPerMonth) return null;
       const counter = await tx.companySettings.update({ where: { organizationId: organization.id }, data: { quoteCounter: { increment: 1 } } });
       const number = `Q-${new Date().getUTCFullYear()}-${String(counter.quoteCounter).padStart(5, '0')}`;
       const created = await tx.quote.create({ data: { organizationId: organization.id, createdById: user.id, sourceQuoteId: body.sourceQuoteId || null, number, customerId, rfqId: rfq?.id || null, title, status, currency, discount: Number(body.discount || 0).toFixed(4), expiryDate, paymentTerms: String(body.paymentTerms || body.payment || '').slice(0, 500) || null, deliveryTerms: String(body.deliveryTerms || body.delivery || '').slice(0, 500) || null, customerNotes: String(body.customerNotes || body.notes || '').slice(0, 2000) || null, version: 1, items: { create: lines.map(line => ({ ...quoteItemData(line) })) } }, include: { items: { orderBy: { sortOrder: 'asc' } } } });
       await tx.quoteEvent.create({ data: { quoteId: created.id, type: 'CREATED', actorUserId: user.id } });
       await tx.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'quote.created', objectType: 'Quote', objectId: created.id } });
       return created;
-    });
-    return json(201, { item: quoteDTO(quote), totals, warning: totals.margin < minimumMargin && marginMode === 'WARNING' ? 'Quote is below the configured margin guideline.' : null });
+      }, { isolationLevel: 'Serializable' });
+    } catch (error) {
+      if (error.code === 'P2034') return json(409, { error: 'A concurrent quote creation is in progress. Please retry.' });
+      throw error;
+    }
+    if (!quote) return json(402, { error: 'Your plan monthly quotation limit has been reached.' });
+    return json(201, { item: quoteDTO(quote), totals, warning: policy.warning });
   }
   const approveMatch = /^\/quotes\/([^/]+)\/approve$/.exec(path);
   if (approveMatch && method === 'POST') {
@@ -822,7 +960,18 @@ export function createHandler(dependencies = {}) {
     if (quote.status === 'INTERNAL_REVIEW' && !['OWNER', 'ADMIN', 'SALES_MANAGER'].includes(role)) return json(403, { error: 'A manager must approve this quote before sending.' });
     const currentFinancialHash = financialFingerprint(quote);
     const calculatedSendTotals = calculateQuote({ items: quote.items.map(item => ({ qty: Number(item.quantity), cost: Number(item.costSnapshot), price: Number(item.sellingPrice), tax: Number(item.taxRate) })), discount: Number(quote.discount) });
-    const settingsMargin = Number(quote.organization.settings?.minMargin ?? 20), requiresApproval = calculatedSendTotals.margin < settingsMargin || quote.items.some(item => item.minimumPriceSnapshot != null && amountScaled(item.sellingPrice) < amountScaled(item.minimumPriceSnapshot));
+    const settings = quote.organization.settings;
+    const sendPolicy = evaluateQuotePolicy({
+      margin: calculatedSendTotals.margin,
+      minimumMargin: Number(settings?.minMargin ?? settings?.data?.margin ?? 20),
+      marginMode: settings?.marginMode || settings?.data?.marginMode || 'WARNING',
+      belowMinimumPrice: quote.items.some(item => item.minimumPriceSnapshot != null && amountScaled(item.sellingPrice) < amountScaled(item.minimumPriceSnapshot)),
+      // A below-catalog-minimum quote can only exist after an authorized
+      // approval-required save. Never let a changed WARNING policy waive it.
+      allowMinimumOverride: true
+    });
+    if (sendPolicy.blockedReason) return json(409, { error: sendPolicy.blockedReason });
+    const requiresApproval = sendPolicy.requiresApproval || quote.status === 'INTERNAL_REVIEW';
     if (requiresApproval) {
       const approval = await prisma.quoteApproval.findFirst({ where: { quoteId: quote.id, quoteVersion: quote.version, financialHash: currentFinancialHash }, orderBy: { createdAt: 'desc' } });
       if (!approval) return json(409, { error: 'This quote requires a current manager approval before it can be sent.' });
@@ -985,8 +1134,9 @@ const legacyEventAdapter = createHandler();
 
 /** Modern Netlify Functions request/response entry point. */
 export default async function netlifyHandler(request, context) {
-  const startedAt = Date.now(), requestId = request.headers.get('x-request-id') || randomBytes(12).toString('hex');
+  const startedAt = Date.now(), requestId = randomBytes(12).toString('hex');
   const url = new URL(request.url);
+  const safeLogPath = sanitizedRequestPath(url.pathname);
   const headers = Object.fromEntries(request.headers.entries());
   if (context?.ip) headers['x-nf-client-connection-ip'] = context.ip;
   let body = '';
@@ -1000,14 +1150,14 @@ export default async function netlifyHandler(request, context) {
   try { monitor = createMonitor(readConfig()); } catch {}
   try { result = await legacyEventAdapter({ path: url.pathname, httpMethod: request.method, headers, body }); }
   catch (error) {
-    console.error('unhandled_api_error', { requestId, method: request.method, path: url.pathname, message: error.message });
-    if (monitor) await monitor.capture({ event: 'unhandled_api_error', message: error.message, requestId, method: request.method, path: url.pathname, status: 500 }).catch(() => {});
+    console.error('unhandled_api_error', { requestId, method: request.method, path: safeLogPath, message: error.message });
+    if (monitor) await monitor.capture({ event: 'unhandled_api_error', message: error.message, requestId, method: request.method, path: safeLogPath, status: 500 }).catch(() => {});
     result = json(500, { error: 'An unexpected server error occurred.', requestId });
   }
   const responseHeaders = new Headers(result.headers || {});
   responseHeaders.set('x-request-id', requestId);
   for (const cookie of result.multiValueHeaders?.['set-cookie'] || []) responseHeaders.append('set-cookie', cookie);
-  console.log(JSON.stringify({ level: 'info', event: 'request_completed', requestId, method: request.method, path: url.pathname, status: result.statusCode || 200, durationMs: Date.now() - startedAt }));
-  if (monitor && (result.statusCode || 200) >= 500) await monitor.capture({ event: 'api_failure', message: 'API request failed', requestId, method: request.method, path: url.pathname, status: result.statusCode || 500 }).catch(() => {});
+  console.log(JSON.stringify({ level: 'info', event: 'request_completed', requestId, method: request.method, path: safeLogPath, status: result.statusCode || 200, durationMs: Date.now() - startedAt }));
+  if (monitor && (result.statusCode || 200) >= 500) await monitor.capture({ event: 'api_failure', message: 'API request failed', requestId, method: request.method, path: safeLogPath, status: result.statusCode || 500 }).catch(() => {});
   return new Response(result.isBase64Encoded ? Buffer.from(result.body || '', 'base64') : result.body || '', { status: result.statusCode || 200, headers: responseHeaders });
 }
