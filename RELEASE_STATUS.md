@@ -1,7 +1,11 @@
 # Release Status
 
-## STAGING_READY
+## STAGING_READY — pending live qualification
 
-As of 8 October 2026, local code validation is green: 50 automated tests pass, Prisma validates and generates, the static/Netlify build passes, and the previously recorded browser suite has 51 checks. CI, non-destructive staging database qualification, monitoring hooks, distributed authentication limits, email verification policy, ownership transfer, and sole Owner account deletion protection are implemented.
+The source has passed local clean-install checks and GitHub pull-request CI. The original buyer clean-install run recorded 50 automated tests and 52 fictional browser checks. The targeted launch-audit correction pull request adds regression tests; use the latest GitHub Actions run for the current automated test count. The amended customer maintenance UI still needs its own live browser review after deployment.
 
-This is not `BETA_READY`: no managed PostgreSQL migration/runtime, Netlify staging deploy, live Stripe/Resend/Gemini/S3/Upstash/monitoring smoke, or backup restore drill was available in this workspace. Follow `STAGING_QUALIFICATION.md`; advance the classification only after its critical checks have evidence.
+Source corrections include discount reconciliation, margin policy consistency, customer maintenance, canonical PDF archival, Stripe webhook reconciliation and ordering, strict past-due grace handling, sanitized customer-link logs and serializable quote/team/storage quota reservations.
+
+This is **not** BETA_READY or PRODUCTION_READY. Managed PostgreSQL migrations/runtime, isolated Netlify staging, real Stripe/Resend/Gemini/S3/Upstash/monitoring smoke tests, an independent restore drill and a browser walk-through of the new customer controls remain to be completed.
+
+Do not imply that CI validates credentials, live provider behavior or that these staging gates have passed.
