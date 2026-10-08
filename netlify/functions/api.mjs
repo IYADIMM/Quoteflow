@@ -415,8 +415,36 @@ export function createHandler(dependencies = {}) {
   if (quotePdfMatch && method === 'GET') {
     const quote = await prisma.quote.findFirst({ where: { id: quotePdfMatch[1], organizationId: organization.id, deletedAt: null }, include: { items: { orderBy: { sortOrder: 'asc' } } } });
     if (!quote || !quote.snapshot || !['SENT', 'VIEWED', 'ACCEPTED', 'REJECTED'].includes(quote.status)) return json(409, { error: 'Save and send the quote before generating its immutable customer PDF.' });
-    const pdf = await makePdf(quote, config.pdf); const fileName = `${quote.number}-v${quote.snapshot.version || quote.version}.pdf`;
-    if (config.storage.enabled) { const storage = makeStorage(config), key = storageKey(organization.id, '.pdf', 'generated-quotes'); await storage.put({ key, body: pdf, mimeType: 'application/pdf' }); await prisma.attachment.upsert({ where: { organizationId_storageKey: { organizationId: organization.id, storageKey: key } }, create: { organizationId: organization.id, quoteId: quote.id, storageKey: key, kind: 'QUOTE_PDF', status: 'READY', provider: config.storage.provider, fileName, mimeType: 'application/pdf', byteSize: pdf.length, sha256: sha256(pdf) }, update: { status: 'READY', byteSize: pdf.length, sha256: sha256(pdf) } }).catch(async () => prisma.attachment.create({ data: { organizationId: organization.id, quoteId: quote.id, storageKey: key, kind: 'QUOTE_PDF', status: 'READY', provider: config.storage.provider, fileName, mimeType: 'application/pdf', byteSize: pdf.length, sha256: sha256(pdf) } })); }
+    const version = quote.snapshot.version || quote.version;
+    const fileName = `${quote.number}-v${version}.pdf`;
+    let pdf;
+    if (config.storage.enabled) {
+      const storage = makeStorage(config);
+      // Immutable snapshot -> one canonical archive per revision. Reuse legacy
+      // archived PDFs too, rather than creating more copies on every download.
+      const archived = await prisma.attachment.findFirst({ where: { organizationId: organization.id, quoteId: quote.id, kind: 'QUOTE_PDF', fileName, status: 'READY', deletedAt: null }, orderBy: { createdAt: 'asc' } });
+      if (archived) {
+        pdf = await storage.get(archived.storageKey);
+      } else {
+        pdf = await makePdf(quote, config.pdf);
+        const key = `${organization.id}/generated-quotes/${quote.id}/v${version}.pdf`;
+        const existingKey = await prisma.attachment.findUnique({ where: { organizationId_storageKey: { organizationId: organization.id, storageKey: key } } });
+        if (existingKey?.status === 'READY' && !existingKey.deletedAt) {
+          pdf = await storage.get(key);
+        } else {
+          // Concurrent first downloads share the same object key and unique
+          // database attachment; no new keys or quota usage per download.
+          await storage.put({ key, body: pdf, mimeType: 'application/pdf' });
+          await prisma.attachment.upsert({
+            where: { organizationId_storageKey: { organizationId: organization.id, storageKey: key } },
+            create: { organizationId: organization.id, quoteId: quote.id, storageKey: key, kind: 'QUOTE_PDF', status: 'READY', provider: config.storage.provider, fileName, mimeType: 'application/pdf', byteSize: pdf.length, sha256: sha256(pdf) },
+            update: { status: 'READY', deletedAt: null, byteSize: pdf.length, sha256: sha256(pdf) }
+          });
+        }
+      }
+    } else {
+      pdf = await makePdf(quote, config.pdf);
+    }
     await prisma.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'quote.pdf_generated', objectType: 'Quote', objectId: quote.id, metadata: { version: quote.snapshot.version || quote.version } } });
     return binary(200, pdf, 'application/pdf', fileName);
   }
