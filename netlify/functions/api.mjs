@@ -507,6 +507,41 @@ export function createHandler(dependencies = {}) {
     await prisma.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'customer.created', objectType: 'Customer', objectId: item.id } });
     return json(201, { item: { ...item, name: item.companyName, contact: item.contactName } });
   }
+  const customerMatch = /^\/customers\/([^/]+)$/.exec(path);
+  if (customerMatch && ['PATCH', 'DELETE'].includes(method)) {
+    if (!['OWNER', 'ADMIN', 'SALES_MANAGER', 'SALES_REP'].includes(role)) return json(403, { error: 'Read-only role.' });
+    const existing = await prisma.customer.findFirst({ where: { id: customerMatch[1], organizationId: organization.id, deletedAt: null } });
+    if (!existing) return json(404, { error: 'Customer not found in this organization.' });
+    if (method === 'DELETE') {
+      const archived = await prisma.customer.updateMany({ where: { id: existing.id, organizationId: organization.id, deletedAt: null }, data: { deletedAt: new Date() } });
+      if (!archived.count) return json(409, { error: 'This customer has already been archived.' });
+      await prisma.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'customer.archived', objectType: 'Customer', objectId: existing.id } });
+      return json(200, { archived: true });
+    }
+    const fields = {
+      companyName: ['companyName', 'name', 200],
+      contactName: ['contactName', 'contact', 160],
+      email: ['email', null, 254],
+      phone: ['phone', null, 60],
+      address: ['address', null, 1000],
+      industry: ['industry', null, 100],
+      notes: ['notes', null, 2000]
+    };
+    const data = {};
+    for (const [column, [source, alias, maxLength]] of Object.entries(fields)) {
+      if (!Object.prototype.hasOwnProperty.call(body, source) && !(alias && Object.prototype.hasOwnProperty.call(body, alias))) continue;
+      const value = body[source] ?? (alias ? body[alias] : null);
+      if (value !== null && typeof value !== 'string') return json(400, { error: 'Customer fields must contain text.' });
+      const clean = (value || '').trim();
+      if (clean.length > maxLength || (column === 'companyName' && !clean)) return json(400, { error: 'Customer information is missing or too long.' });
+      if (column === 'email' && clean && !/^\S+@\S+\.\S+$/.test(clean)) return json(400, { error: 'Customer email is invalid.' });
+      data[column] = clean || null;
+    }
+    if (!Object.keys(data).length) return json(400, { error: 'No editable customer fields were provided.' });
+    const item = await prisma.customer.update({ where: { id: existing.id }, data });
+    await prisma.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'customer.updated', objectType: 'Customer', objectId: item.id, metadata: { fields: Object.keys(data) } } });
+    return json(200, { item: { ...item, name: item.companyName, contact: item.contactName } });
+  }
   if (path === '/products' && method === 'GET') {
     const items = await prisma.catalogItem.findMany({ where: { organizationId: organization.id, deletedAt: null }, orderBy: { createdAt: 'desc' } });
     return json(200, { items: items.map(({ cost, sellingPrice, taxRate, ...item }) => ({ ...item, price: sellingPrice, tax: taxRate })) });
