@@ -3,14 +3,60 @@ generator client {
   output   = "../generated/prisma"
 }
 
-datasource db { provider = "postgresql" }
+datasource db {
+  provider = "postgresql"
+}
 
-enum Role { OWNER ADMIN SALES_MANAGER SALES_REP VIEWER }
-enum QuoteStatus { DRAFT INTERNAL_REVIEW SENDING SENT VIEWED ACCEPTED REJECTED EXPIRED }
-enum RFQStatus { NEW REVIEWING PRICING QUOTED WON LOST EXPIRED CANCELLED }
-enum FollowUpStatus { PENDING COMPLETED SNOOZED }
-enum CatalogType { PRODUCT SERVICE LABOR MATERIAL PACKAGE }
-enum IntegrationKind { AI EMAIL STORAGE BILLING }
+enum Role {
+  OWNER
+  ADMIN
+  SALES_MANAGER
+  SALES_REP
+  VIEWER
+}
+
+enum QuoteStatus {
+  DRAFT
+  INTERNAL_REVIEW
+  SENDING
+  SENT
+  VIEWED
+  ACCEPTED
+  REJECTED
+  EXPIRED
+}
+
+enum RFQStatus {
+  NEW
+  REVIEWING
+  PRICING
+  QUOTED
+  WON
+  LOST
+  EXPIRED
+  CANCELLED
+}
+
+enum FollowUpStatus {
+  PENDING
+  COMPLETED
+  SNOOZED
+}
+
+enum CatalogType {
+  PRODUCT
+  SERVICE
+  LABOR
+  MATERIAL
+  PACKAGE
+}
+
+enum IntegrationKind {
+  AI
+  EMAIL
+  STORAGE
+  BILLING
+}
 
 model User {
   id String @id @default(cuid())
@@ -59,6 +105,8 @@ model Organization {
   attachments Attachment[]
   integrations Integration[]
   invitations Invitation[]
+  stripeEvents StripeEvent[]
+  deletionRequests OrganizationDeletionRequest[]
 }
 model Membership {
   id String @id @default(cuid())
@@ -155,6 +203,7 @@ model RFQ {
   customer Customer @relation(fields:[customerId], references:[id], onDelete:Restrict)
   items RFQItem[]
   quotes Quote[]
+  attachments Attachment[]
   @@unique([organizationId, number])
   @@index([organizationId, status, deadline])
 }
@@ -190,6 +239,13 @@ model Quote {
   internalNotes String?
   publicTokenHash String? @unique
   publicTokenExpiresAt DateTime?
+  sendAttemptKey String?
+  sendAttemptState String?
+  sendAttemptAt DateTime?
+  createdById String?
+  sourceQuoteId String?
+  sourceQuote Quote? @relation("QuoteRevisions", fields:[sourceQuoteId], references:[id], onDelete:SetNull)
+  revisions Quote[] @relation("QuoteRevisions")
   version Int @default(1)
   snapshot Json?
   sentAt DateTime?
@@ -207,6 +263,8 @@ model Quote {
   events QuoteEvent[]
   followUps FollowUp[]
   acceptance QuoteAcceptance?
+  approvals QuoteApproval[]
+  attachments Attachment[]
   @@unique([organizationId, number])
   @@index([organizationId, status, issueDate])
   @@index([organizationId, customerId])
@@ -222,6 +280,7 @@ model QuoteItem {
   unitSnapshot String
   costSnapshot Decimal @db.Decimal(16,4)
   sellingPrice Decimal @db.Decimal(16,4)
+  minimumPriceSnapshot Decimal? @db.Decimal(16,4)
   taxRate Decimal @db.Decimal(7,4)
   sortOrder Int @default(0)
   quote Quote @relation(fields:[quoteId], references:[id], onDelete:Cascade)
@@ -236,6 +295,17 @@ model QuoteEvent {
   createdAt DateTime @default(now())
   quote Quote @relation(fields:[quoteId], references:[id], onDelete:Cascade)
   @@index([quoteId, createdAt])
+}
+model QuoteApproval {
+  id String @id @default(cuid())
+  quoteId String
+  quoteVersion Int
+  approverUserId String
+  financialHash String
+  createdAt DateTime @default(now())
+  quote Quote @relation(fields:[quoteId], references:[id], onDelete:Cascade)
+  @@index([quoteId, quoteVersion])
+  @@unique([quoteId, quoteVersion])
 }
 model QuoteAcceptance {
   id String @id @default(cuid())
@@ -281,7 +351,14 @@ model Subscription {
   status String @default("INACTIVE")
   stripeCustomerId String? @unique
   stripeSubscriptionId String? @unique
+  stripePriceId String?
+  stripeProductId String?
+  currentPeriodStart DateTime?
   currentPeriodEnd DateTime?
+  cancelAtPeriodEnd Boolean @default(false)
+  canceledAt DateTime?
+  trialEnd DateTime?
+  lastStripeSyncAt DateTime?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   organization Organization @relation(fields:[organizationId], references:[id], onDelete:Cascade)
@@ -303,7 +380,12 @@ model AIUsage {
 model Attachment {
   id String @id @default(cuid())
   organizationId String
+  rfqId String?
+  quoteId String?
   storageKey String
+  kind String @default("RFQ_ATTACHMENT")
+  status String @default("PENDING")
+  provider String
   fileName String
   mimeType String
   byteSize Int
@@ -311,7 +393,33 @@ model Attachment {
   createdAt DateTime @default(now())
   deletedAt DateTime?
   organization Organization @relation(fields:[organizationId], references:[id], onDelete:Cascade)
+  rfq RFQ? @relation(fields:[rfqId], references:[id], onDelete:Cascade)
+  quote Quote? @relation(fields:[quoteId], references:[id], onDelete:Cascade)
   @@index([organizationId, createdAt])
+  @@index([organizationId, rfqId, status])
+  @@index([organizationId, quoteId, status])
+  @@unique([organizationId, storageKey])
+}
+model StripeEvent {
+  id String @id
+  organizationId String?
+  type String
+  livemode Boolean
+  processedAt DateTime @default(now())
+  payloadHash String
+  organization Organization? @relation(fields:[organizationId], references:[id], onDelete:SetNull)
+  @@index([organizationId, processedAt])
+}
+model OrganizationDeletionRequest {
+  id String @id @default(cuid())
+  organizationId String
+  requestedById String
+  requestedAt DateTime @default(now())
+  scheduledFor DateTime
+  canceledAt DateTime?
+  completedAt DateTime?
+  organization Organization @relation(fields:[organizationId], references:[id], onDelete:Cascade)
+  @@index([organizationId, scheduledFor])
 }
 model Integration {
   id String @id @default(cuid())

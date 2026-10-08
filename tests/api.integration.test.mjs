@@ -112,3 +112,110 @@ test('AI request reservations atomically enforce plan and hashed-IP limits befor
   const limitedDb = { ...prisma, $transaction: async fn => fn({ aiUsage: { count: async ({ where }) => where.createdAt.gte.getDate() === 1 ? 25 : 0 }, subscription: { findUnique: async () => ({ plan: 'FREE' }) } }) };
   assert.deepEqual(await reserveAIUsage(limitedDb, 'org-1', 'extract-rfq', config, '203.0.113.4'), { limited: 'limit' });
 });
+
+test('public quote viewing records activity without incrementing its commercial version', async () => {
+  const token = 'public-token'; let storedVersion = 4, viewedAt = null, eventType;
+  const quote = { id: 'quote-1', organizationId: 'org-1', status: 'SENT', version: 4, publicTokenExpiresAt: new Date(Date.now() + 86_400_000), expiryDate: null, snapshot: { version: 4, items: [], totals: { subtotal: 10, tax: 0.5, total: 10.5 }, customer: {}, company: {}, terms: {} } };
+  const prisma = { quote: { findFirst: async () => ({ ...quote, version: storedVersion }) }, $transaction: async fn => fn({ quote: { updateMany: async ({ data }) => { if (data.version) storedVersion += data.version.increment; viewedAt = data.viewedAt; return { count: 1 }; } }, quoteEvent: { create: async ({ data }) => { eventType = data.type; } } }) };
+  const handler = createHandler({ readConfig: () => config, getPrisma: async () => prisma });
+  const result = await handler({ path: `/api/public/quote/${token}`, httpMethod: 'GET', headers: {} });
+  assert.equal(result.statusCode, 200);
+  assert.equal(storedVersion, 4);
+  assert.ok(viewedAt);
+  assert.equal(eventType, 'VIEWED');
+});
+
+test('public customer question is retained when seller notification email fails', async () => {
+  let savedEvent;
+  const prisma = { quote: { findFirst: async () => ({ id: 'quote-1', number: 'Q-1', organizationId: 'org-1', status: 'SENT', version: 2, publicTokenExpiresAt: new Date(Date.now() + 86_400_000), expiryDate: null, snapshot: {} }) }, quoteEvent: { create: async ({ data }) => { savedEvent = data; } }, companySettings: { findUnique: async () => ({ data: { email: 'sales@example.test' } }) } };
+  const handler = createHandler({ readConfig: () => config, getPrisma: async () => prisma, emailProvider: () => ({ send: async () => { throw new Error('provider unavailable'); } }) });
+  const result = await handler({ path: '/api/public/quote/question-token', httpMethod: 'POST', headers: { origin: config.appUrl }, body: JSON.stringify({ action: 'question', name: 'Buyer', email: 'buyer@example.test', message: 'Can you confirm delivery timing?' }) });
+  assert.equal(result.statusCode, 200);
+  assert.equal(savedEvent.type, 'CUSTOMER_QUESTION');
+  assert.equal(savedEvent.metadata.message, 'Can you confirm delivery timing?');
+});
+
+test('public responses reject expired quotes', async () => {
+  const token = 'expired-token';
+  const prisma = { quote: { findFirst: async () => ({ id: 'quote-1', organizationId: 'org-1', status: 'SENT', version: 3, publicTokenExpiresAt: new Date(Date.now() + 86_400_000), expiryDate: new Date(Date.now() - 60_000), snapshot: {} }) } };
+  const handler = createHandler({ readConfig: () => config, getPrisma: async () => prisma });
+  const result = await handler({ path: `/api/public/quote/${token}`, httpMethod: 'POST', headers: { origin: config.appUrl }, body: JSON.stringify({ action: 'accept', name: 'Buyer', email: 'buyer@example.test', agree: true }) });
+  assert.equal(result.statusCode, 404);
+});
+
+test('a same-key retry after send finalization is idempotent without persisting the raw bearer link', async () => {
+  const sessionToken = 'send-session', requestKey = 'retry-key-123';
+  const quote = { id: 'quote-1', organizationId: 'org-1', status: 'SENT', version: 7, sendAttemptKey: requestKey, sendAttemptState: 'SENT', snapshot: { publicUrl: 'https://quoteflow.test/q/issued' }, deletedAt: null };
+  const prisma = {
+    session: { findUnique: async () => ({ id: 'session-1', userId: 'user-1', organizationId: 'org-1', expiresAt: new Date(Date.now() + 60_000), user: { id: 'user-1' }, organization: { id: 'org-1', reportingCurrency: 'AED' } }) },
+    membership: { findUnique: async () => ({ role: 'SALES_REP' }) },
+    quote: { findFirst: async () => quote }
+  };
+  let emailCalls = 0;
+  const handler = createHandler({ readConfig: () => config, getPrisma: async () => prisma, emailProvider: () => ({ send: async () => { emailCalls++; } }) });
+  const result = await handler({ path: '/api/quotes/quote-1/send', httpMethod: 'POST', headers: { cookie: `qf_session=${sessionToken}; qf_csrf=csrf`, 'x-csrf-token': 'csrf', origin: config.appUrl }, body: JSON.stringify({ idempotencyKey: requestKey }) });
+  assert.equal(result.statusCode, 200);
+  assert.equal(JSON.parse(result.body).duplicate, true);
+  assert.equal(JSON.parse(result.body).publicUrl, null);
+  assert.equal(emailCalls, 0);
+});
+
+test('billing checkout is server-authorized and uses the active session organization', async () => {
+  const sessionToken = 'billing-session';
+  const billingConfig = { ...config, stripe: { enabled: true, secretKey: 'sk_test', webhookSecret: 'whsec_test', prices: { PRO: 'price_pro', BUSINESS: 'price_business' } }, storage: { enabled: false }, pdf: {} };
+  const makePrisma = role => ({
+    session: { findUnique: async () => ({ id: 'session-1', userId: 'user-1', organizationId: 'org-a', expiresAt: new Date(Date.now() + 60_000), user: { id: 'user-1', email: 'owner@example.test' }, organization: { id: 'org-a', name: 'Alpha', reportingCurrency: 'AED' } }) },
+    membership: { findUnique: async () => ({ role }) },
+    subscription: { findUnique: async () => ({ id: 'sub-row', organizationId: 'org-a', stripeCustomerId: 'cus_1' }) },
+    auditLog: { create: async ({ data }) => { assert.equal(data.organizationId, 'org-a'); } }
+  });
+  let checkoutArgs;
+  const billingProvider = () => ({ createCheckout: async args => { checkoutArgs = args; return { url: 'https://checkout.stripe.test/session' }; } });
+  const event = { path: '/api/billing/checkout', httpMethod: 'POST', headers: { cookie: `qf_session=${sessionToken}; qf_csrf=csrf`, 'x-csrf-token': 'csrf', origin: config.appUrl }, body: JSON.stringify({ plan: 'PRO', organizationId: 'org-forged', amount: 1 }) };
+  const denied = await createHandler({ readConfig: () => billingConfig, getPrisma: async () => makePrisma('VIEWER'), billingProvider })(event);
+  assert.equal(denied.statusCode, 403);
+  const accepted = await createHandler({ readConfig: () => billingConfig, getPrisma: async () => makePrisma('OWNER'), billingProvider })(event);
+  assert.equal(accepted.statusCode, 200);
+  assert.equal(checkoutArgs.organizationId, 'org-a');
+  assert.equal(checkoutArgs.plan, 'PRO');
+  assert.equal('amount' in checkoutArgs, false);
+});
+
+test('Stripe webhooks verify signatures, persist subscription state and ignore duplicate event IDs', async () => {
+  const billingConfig = { ...config, stripe: { enabled: true, secretKey: 'sk_test', webhookSecret: 'whsec_test', prices: { PRO: 'price_pro', BUSINESS: 'price_business' } }, storage: { enabled: false }, pdf: {} };
+  const stripeEvent = { id: 'evt_1', type: 'customer.subscription.updated', livemode: false, data: { object: { id: 'sub_1', customer: 'cus_1', status: 'active', current_period_start: 10, current_period_end: 20, metadata: { quoteflowOrganizationId: 'org-1' }, items: { data: [{ price: { id: 'price_pro', product: 'prod_1' } }] } } } };
+  let storedSubscription, signatureCalls = 0;
+  const tx = { stripeEvent: { create: async ({ data }) => { assert.equal(data.id, 'evt_1'); } }, subscription: { upsert: async ({ create }) => { storedSubscription = create; } }, auditLog: { create: async () => ({}) } };
+  const prisma = { $transaction: async fn => fn(tx) };
+  const provider = () => ({ constructEvent: async (payload, signature) => { signatureCalls++; assert.equal(payload, '{"event":true}'); assert.equal(signature, 'valid-signature'); return stripeEvent; } });
+  const handler = createHandler({ readConfig: () => billingConfig, getPrisma: async () => prisma, billingProvider: provider });
+  const result = await handler({ path: '/api/stripe/webhook', httpMethod: 'POST', headers: { 'stripe-signature': 'valid-signature' }, body: '{"event":true}' });
+  assert.equal(result.statusCode, 200);
+  assert.equal(signatureCalls, 1);
+  assert.equal(storedSubscription.organizationId, 'org-1');
+  assert.equal(storedSubscription.plan, 'PRO');
+  assert.equal(storedSubscription.status, 'ACTIVE');
+
+  const duplicatePrisma = { $transaction: async () => { const error = new Error('duplicate'); error.code = 'P2002'; throw error; } };
+  const duplicate = await createHandler({ readConfig: () => billingConfig, getPrisma: async () => duplicatePrisma, billingProvider: provider })({ path: '/api/stripe/webhook', httpMethod: 'POST', headers: { 'stripe-signature': 'valid-signature' }, body: '{"event":true}' });
+  assert.equal(duplicate.statusCode, 200);
+  assert.equal(JSON.parse(duplicate.body).duplicate, true);
+});
+
+test('team mutations are tenant scoped and preserve organization ownership', async () => {
+  const token = 'team-session', members = { owner: { userId: 'owner', organizationId: 'org-1', role: 'OWNER' }, rep: { userId: 'rep', organizationId: 'org-1', role: 'SALES_REP' } };
+  let removed;
+  const prisma = {
+    session: { findUnique: async () => ({ id: 'session-1', userId: 'owner', organizationId: 'org-1', expiresAt: new Date(Date.now() + 60_000), user: { id: 'owner', email: 'owner@example.test', passwordHash: 'salt:00' }, organization: { id: 'org-1', reportingCurrency: 'AED' } }), deleteMany: async ({ where }) => { removed = where; return { count: 1 }; } },
+    membership: { findUnique: async ({ where }) => members[where.userId_organizationId.userId] || null, delete: async ({ where }) => { delete members[where.userId_organizationId.userId]; return {}; } },
+    auditLog: { create: async () => ({}) },
+    $transaction: async fn => fn(prisma)
+  };
+  const handler = createHandler({ readConfig: () => config, getPrisma: async () => prisma });
+  const call = userId => handler({ path: `/api/team/${userId}`, httpMethod: 'DELETE', headers: { cookie: `qf_session=${token}; qf_csrf=csrf`, 'x-csrf-token': 'csrf', origin: config.appUrl }, body: '{}' });
+  assert.equal((await call('owner')).statusCode, 409);
+  assert.equal((await call('outside-org')).statusCode, 404);
+  assert.equal((await call('rep')).statusCode, 200);
+  assert.equal(members.rep, undefined);
+  assert.equal(removed.organizationId, 'org-1');
+});

@@ -5,18 +5,26 @@ import { getPrisma } from '../../lib/prisma.mjs';
 import { GeminiProvider } from '../../lib/ai-provider.mjs';
 import { createEmailProvider } from '../../lib/email-provider.mjs';
 import { calculateQuote } from '../../lib/pricing.mjs';
+import { amountScaled, normalizeQuoteLines, quoteItemData, validCurrency } from '../../lib/quote-lines.mjs';
+import { StripeBillingProvider, stripePayloadHash, subscriptionRecord } from '../../lib/billing-provider.mjs';
+import { entitlementsFor } from '../../lib/entitlements.mjs';
+import { S3StorageProvider, storageKey, validateUpload } from '../../lib/storage-provider.mjs';
+import { generateQuotePdf } from '../../lib/pdf-provider.mjs';
+import { createRateLimiter } from '../../lib/rate-limit.mjs';
 
 export const config = { path: '/api/*' };
 const scrypt = promisify(scryptCallback);
 const sha256 = value => createHash('sha256').update(value).digest('hex');
+const financialFingerprint = quote => sha256(JSON.stringify({ currency: quote.currency, discount: String(quote.discount), items: quote.items.map(item => [item.catalogItemId, item.nameSnapshot, item.quantity.toString(), item.unitSnapshot, item.costSnapshot.toString(), item.sellingPrice.toString(), item.minimumPriceSnapshot?.toString() || null, item.taxRate.toString()]) }));
 const cookieValue = token => { try { return decodeURIComponent(token); } catch { return ''; } };
 const json = (statusCode, body, headers = {}) => {
   const { 'set-cookie': cookies, ...singleHeaders } = headers;
   return { statusCode, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...singleHeaders }, ...(cookies ? { multiValueHeaders: { 'set-cookie': Array.isArray(cookies) ? cookies : [cookies] } } : {}), body: JSON.stringify(body) };
 };
+const binary = (statusCode, body, contentType, fileName) => ({ statusCode, isBase64Encoded: true, headers: { 'content-type': contentType, 'content-disposition': `attachment; filename="${String(fileName).replace(/[^a-zA-Z0-9_.-]/g, '_')}"`, 'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' }, body: body.toString('base64') });
 const ai = config => new GeminiProvider({ apiKey: config.ai.apiKey, model: config.ai.model });
 const titleStatus = value => ({ DRAFT: 'Draft', INTERNAL_REVIEW: 'Internal Review', SENDING: 'Sending', SENT: 'Sent', VIEWED: 'Viewed', ACCEPTED: 'Accepted', REJECTED: 'Rejected', EXPIRED: 'Expired', NEW: 'New', REVIEWING: 'Reviewing', PRICING: 'Pricing', QUOTED: 'Quoted', WON: 'Won', LOST: 'Lost', CANCELLED: 'Cancelled', PENDING: 'Pending', COMPLETED: 'Completed', SNOOZED: 'Snoozed' })[value] || value;
-const quoteDTO = quote => ({ ...quote, created: quote.issueDate?.toISOString().slice(0, 10), expiry: quote.expiryDate?.toISOString().slice(0, 10) || '', payment: quote.paymentTerms, delivery: quote.deliveryTerms, notes: quote.customerNotes, status: titleStatus(quote.status), discount: Number(quote.discount), items: (quote.items || []).map(line => ({ catalogItemId: line.catalogItemId, name: line.nameSnapshot, sku: line.skuSnapshot, description: line.descriptionSnapshot, qty: Number(line.quantity), unit: line.unitSnapshot, cost: Number(line.costSnapshot), price: Number(line.sellingPrice), tax: Number(line.taxRate) })) });
+const quoteDTO = quote => ({ ...quote, created: quote.issueDate?.toISOString().slice(0, 10), expiry: quote.expiryDate?.toISOString().slice(0, 10) || '', payment: quote.paymentTerms, delivery: quote.deliveryTerms, notes: quote.customerNotes, status: titleStatus(quote.status), discount: Number(quote.discount), items: (quote.items || []).map(line => ({ id: line.id, catalogItemId: line.catalogItemId, lineType: line.catalogItemId ? 'CATALOG' : 'MANUAL', name: line.nameSnapshot, sku: line.skuSnapshot, description: line.descriptionSnapshot, qty: Number(line.quantity), unit: line.unitSnapshot, cost: Number(line.costSnapshot), price: Number(line.sellingPrice), minimumPrice: line.minimumPriceSnapshot == null ? null : Number(line.minimumPriceSnapshot), tax: Number(line.taxRate) })) });
 
 async function authenticate(event, prisma) {
   const rawCookie = event.headers.cookie || event.headers.Cookie || '';
@@ -63,8 +71,8 @@ export async function reserveAIUsage(prisma, organizationId, feature, config, ip
         tx.aiUsage.count({ where: { organizationId, createdAt: { gte: new Date(new Date().getFullYear(), new Date().getMonth(), 1) } } })
       ]);
       if (recent >= config.ai.maxRequestsPerMinute || ipRecent >= config.ai.maxRequestsPerMinute) return { limited: 'rate' };
-      const plan = subscription?.plan || 'FREE';
-      if (monthCount >= (config.ai.monthlyLimits[plan] ?? config.ai.monthlyLimits.FREE)) return { limited: 'limit' };
+      const limit = entitlementsFor(subscription).limits.aiRequestsPerMonth;
+      if (monthCount >= limit) return { limited: 'limit' };
       const usage = await tx.aiUsage.create({ data: { organizationId, provider: 'gemini', feature, success: false, requestKey } });
       return { id: usage.id };
     }, { isolationLevel: 'Serializable' });
@@ -79,6 +87,10 @@ export function createHandler(dependencies = {}) {
   const loadPrisma = dependencies.getPrisma || getPrisma;
   const makeAI = dependencies.ai || ai;
   const makeEmail = dependencies.emailProvider || createEmailProvider;
+  const makeBilling = dependencies.billingProvider || (config => new StripeBillingProvider({ ...config.stripe, appUrl: config.appUrl }));
+  const makeStorage = dependencies.storageProvider || (config => new S3StorageProvider(config.storage));
+  const makePdf = dependencies.pdfProvider || generateQuotePdf;
+  const makeRateLimiter = dependencies.rateLimiter || createRateLimiter;
   return async function handler(event) {
   let config, prisma;
   try { config = loadConfig(); }
@@ -92,9 +104,44 @@ export function createHandler(dependencies = {}) {
   }
   try { prisma = await loadPrisma(); }
   catch (error) { console.error('database_connection_error', error.message); return json(503, { error: 'The PostgreSQL service is unavailable.' }); }
-  if (!csrf(event, config)) return json(403, { error: 'Request origin could not be verified.' });
+  if (path !== '/stripe/webhook' && !csrf(event, config)) return json(403, { error: 'Request origin could not be verified.' });
   const body = (() => { try { return event.body ? JSON.parse(event.body) : {}; } catch { return null; } })();
-  if (body === null) return json(400, { error: 'Request body must be valid JSON.' });
+  if (body === null && path !== '/stripe/webhook') return json(400, { error: 'Request body must be valid JSON.' });
+
+  if (path === '/stripe/webhook' && method === 'POST') {
+    if (!config.stripe.enabled) return json(404, { error: 'Billing webhook is disabled.' });
+    let stripeEvent;
+    try { stripeEvent = await makeBilling(config).constructEvent(event.body || '', event.headers['stripe-signature'] || event.headers['Stripe-Signature'] || ''); }
+    catch (error) { console.error('stripe_webhook_rejected', { message: error.message }); return json(400, { error: 'Stripe signature verification failed.' }); }
+    const object = stripeEvent.data?.object || {}, eventHash = stripePayloadHash(event.body || '');
+    const metadataOrganizationId = object.metadata?.quoteflowOrganizationId || object.client_reference_id || object.subscription_details?.metadata?.quoteflowOrganizationId || null;
+    try {
+      await prisma.$transaction(async tx => {
+        await tx.stripeEvent.create({ data: { id: stripeEvent.id, organizationId: metadataOrganizationId, type: stripeEvent.type, livemode: Boolean(stripeEvent.livemode), payloadHash: eventHash } });
+        if (stripeEvent.type === 'checkout.session.completed' && metadataOrganizationId) {
+          await tx.subscription.upsert({ where: { organizationId: metadataOrganizationId }, create: { organizationId: metadataOrganizationId, plan: String(object.metadata?.plan || 'FREE').toUpperCase(), status: 'INCOMPLETE', stripeCustomerId: typeof object.customer === 'string' ? object.customer : object.customer?.id || null, stripeSubscriptionId: typeof object.subscription === 'string' ? object.subscription : object.subscription?.id || null, lastStripeSyncAt: new Date() }, update: { stripeCustomerId: typeof object.customer === 'string' ? object.customer : object.customer?.id || undefined, stripeSubscriptionId: typeof object.subscription === 'string' ? object.subscription : object.subscription?.id || undefined, lastStripeSyncAt: new Date() } });
+        }
+        if (stripeEvent.type.startsWith('customer.subscription.')) {
+          let organizationId = metadataOrganizationId;
+          if (!organizationId) organizationId = (await tx.subscription.findFirst({ where: { OR: [{ stripeSubscriptionId: object.id }, { stripeCustomerId: typeof object.customer === 'string' ? object.customer : object.customer?.id }] }, select: { organizationId: true } }))?.organizationId;
+          if (!organizationId) throw new Error('Stripe subscription is not linked to a QuoteFlow organization.');
+          await tx.subscription.upsert({ where: { organizationId }, create: { organizationId, ...subscriptionRecord(object, config.stripe.prices) }, update: subscriptionRecord(object, config.stripe.prices) });
+          await tx.auditLog.create({ data: { organizationId, action: `billing.${stripeEvent.type}`, objectType: 'Subscription', objectId: object.id, metadata: { status: object.status, priceId: object.items?.data?.[0]?.price?.id || null } } });
+        }
+        if (['invoice.payment_failed', 'payment_intent.payment_failed'].includes(stripeEvent.type)) {
+          const customerId = typeof object.customer === 'string' ? object.customer : object.customer?.id;
+          const subscription = customerId ? await tx.subscription.findFirst({ where: { stripeCustomerId: customerId } }) : null;
+          if (subscription) { await tx.subscription.update({ where: { organizationId: subscription.organizationId }, data: { status: 'PAST_DUE', lastStripeSyncAt: new Date() } }); await tx.auditLog.create({ data: { organizationId: subscription.organizationId, action: 'billing.payment_failed', objectType: 'Subscription', objectId: subscription.id } }); }
+        }
+        if (['invoice.paid', 'invoice.payment_succeeded'].includes(stripeEvent.type)) {
+          const customerId = typeof object.customer === 'string' ? object.customer : object.customer?.id;
+          const subscription = customerId ? await tx.subscription.findFirst({ where: { stripeCustomerId: customerId } }) : null;
+          if (subscription && subscription.status === 'PAST_DUE') await tx.subscription.update({ where: { organizationId: subscription.organizationId }, data: { status: 'ACTIVE', lastStripeSyncAt: new Date() } });
+        }
+      });
+    } catch (error) { if (error.code === 'P2002') return json(200, { received: true, duplicate: true }); console.error('stripe_webhook_processing_failed', { eventId: stripeEvent.id, type: stripeEvent.type, message: error.message }); return json(500, { error: 'Webhook processing failed and may be retried.' }); }
+    return json(200, { received: true });
+  }
 
   if (path === '/auth/signup' && method === 'POST') {
     const email = String(body.email || '').trim().toLowerCase(), password = body.password, organizationName = String(body.organization || '').trim();
@@ -192,14 +239,25 @@ export function createHandler(dependencies = {}) {
     return json(200, { ok: true });
   }
 
+  const publicPdfMatch = /^\/public\/quote\/([^/]+)\/pdf$/.exec(path);
+  if (publicPdfMatch && method === 'GET') {
+    const quote = await prisma.quote.findFirst({ where: { publicTokenHash: sha256(publicPdfMatch[1]), publicTokenExpiresAt: { gt: new Date() }, deletedAt: null }, include: { items: { orderBy: { sortOrder: 'asc' } } } });
+    if (!quote || !quote.snapshot || !['SENT', 'VIEWED', 'ACCEPTED', 'REJECTED'].includes(quote.status) || (quote.expiryDate && quote.expiryDate < new Date())) return json(404, { error: 'Quote PDF is unavailable.' });
+    const pdf = await makePdf(quote, config.pdf);
+    await prisma.quoteEvent.create({ data: { quoteId: quote.id, type: 'PDF_DOWNLOADED', metadata: { source: 'customer-portal', version: quote.version } } }).catch(() => {});
+    return binary(200, pdf, 'application/pdf', `${quote.number}-v${quote.snapshot.version || quote.version}.pdf`);
+  }
+
   const publicQuoteMatch = /^\/public\/quote\/([^/]+)$/.exec(path);
   if (publicQuoteMatch) {
     const quote = await prisma.quote.findFirst({ where: { publicTokenHash: sha256(publicQuoteMatch[1]), deletedAt: null }, include: { items: { orderBy: { sortOrder: 'asc' } }, acceptance: true } });
-    if (!quote || !quote.publicTokenExpiresAt || quote.publicTokenExpiresAt <= new Date() || !quote.snapshot) return json(404, { error: 'Quote link is invalid or unavailable.' });
+    if (!quote || !quote.publicTokenExpiresAt || quote.publicTokenExpiresAt <= new Date() || !quote.snapshot || (quote.expiryDate && quote.expiryDate < new Date())) return json(404, { error: 'Quote link is invalid or unavailable.' });
     if (method === 'GET') {
       if (quote.status === 'SENT') {
-        const viewed = await prisma.quote.updateMany({ where: { id: quote.id, status: 'SENT', version: quote.version }, data: { status: 'VIEWED', viewedAt: new Date(), version: { increment: 1 } } });
-        if (viewed.count) await prisma.quoteEvent.create({ data: { quoteId: quote.id, type: 'VIEWED', metadata: { source: 'customer-portal' } } });
+        await prisma.$transaction(async tx => {
+          const viewed = await tx.quote.updateMany({ where: { id: quote.id, status: 'SENT', version: quote.version }, data: { status: 'VIEWED', viewedAt: new Date() } });
+          if (viewed.count) await tx.quoteEvent.create({ data: { quoteId: quote.id, type: 'VIEWED', metadata: { source: 'customer-portal', version: quote.version } } });
+        });
       }
       if (!['SENT', 'VIEWED', 'ACCEPTED', 'REJECTED'].includes(quote.status)) return json(404, { error: 'Quote link is invalid or unavailable.' });
       const snapshot = quote.snapshot;
@@ -209,18 +267,37 @@ export function createHandler(dependencies = {}) {
       if (!['accept', 'reject', 'question'].includes(body.action)) return json(400, { error: 'Unsupported response.' });
       if (!['SENT', 'VIEWED'].includes(quote.status)) return json(409, { error: 'This quote already has a final response or is unavailable.' });
       if (body.action === 'question') {
-        const message = String(body.message || '').trim().slice(0, 2000);
-        if (!message) return json(400, { error: 'Enter a question.' });
-        await prisma.quoteEvent.create({ data: { quoteId: quote.id, type: 'CUSTOMER_QUESTION', metadata: { message, name: String(body.name || '').slice(0, 160), email: String(body.email || '').slice(0, 254) } } });
+        const message = String(body.message || '').trim();
+        const name = String(body.name || '').trim(), email = String(body.email || '').trim();
+        if (message.length < 3 || message.length > 2000 || name.length < 1 || name.length > 160 || email.length > 254 || !/^\S+@\S+\.\S+$/.test(email)) return json(400, { error: 'Enter your name, valid email and a question of 3–2,000 characters.' });
+        const limiter = makeRateLimiter(config);
+        if (limiter) {
+          try { const limit = await limiter.consume('public-question', `${quote.id}:${event.headers['x-nf-client-connection-ip'] || event.headers['x-forwarded-for'] || 'unknown'}`, { limit: 5, windowSeconds: 600 }); if (!limit.allowed) return json(429, { error: 'Too many questions were sent recently. Please try again later.' }, { 'retry-after': String(limit.retryAfter) }); }
+          catch (error) { console.error('distributed_rate_limit_unavailable', { scope: 'public-question', message: error.message }); }
+        }
+        if (prisma.quoteEvent.count) {
+          const recentQuestions = await prisma.quoteEvent.count({ where: { quoteId: quote.id, type: 'CUSTOMER_QUESTION', createdAt: { gte: new Date(Date.now() - 10 * 60_000) } } });
+          if (recentQuestions >= 5) return json(429, { error: 'Too many questions were sent recently. Please try again later.' }, { 'retry-after': '600' });
+        }
+        await prisma.quoteEvent.create({ data: { quoteId: quote.id, type: 'CUSTOMER_QUESTION', metadata: { message, name, email } } });
+        const notificationProvider = makeEmail(config);
+        try {
+          const settings = await prisma.companySettings.findUnique({ where: { organizationId: quote.organizationId } });
+          const sellerEmail = settings?.data?.email;
+          if (notificationProvider && sellerEmail) await notificationProvider.send({ to: sellerEmail, subject: `Customer question about quotation ${quote.number}`, text: `${name} (${email}) asked about ${quote.number}:\n\n${message}` });
+        } catch (error) { console.error('quote_question_notification_failed', { quoteId: quote.id, message: error.message }); }
         return json(200, { status: quote.status, message: 'Your question has been recorded.' });
       }
       const name = String(body.name || '').trim().slice(0, 160), email = String(body.email || '').trim().slice(0, 254);
+      if (quote.expiryDate && quote.expiryDate < new Date()) return json(409, { error: 'This quotation has expired and can no longer receive a response.' });
       if (body.action === 'accept' && (!name || !/^\S+@\S+\.\S+$/.test(email) || body.agree !== true)) return json(400, { error: 'Name, valid email and agreement are required.' });
+      const acceptedRevision = Number(quote.snapshot?.version);
+      if (!Number.isInteger(acceptedRevision) || acceptedRevision < 1) return json(409, { error: 'This link does not identify a valid sent revision.' });
       const finalStatus = body.action === 'accept' ? 'ACCEPTED' : 'REJECTED';
       const result = await prisma.$transaction(async tx => {
-        const update = await tx.quote.updateMany({ where: { id: quote.id, status: { in: ['SENT', 'VIEWED'] }, version: quote.version, publicTokenExpiresAt: { gt: new Date() } }, data: { status: finalStatus, ...(finalStatus === 'ACCEPTED' ? { acceptedAt: new Date() } : { rejectedAt: new Date(), rejectionReason: String(body.reason || '').slice(0, 1000) }), version: { increment: 1 } } });
+        const update = await tx.quote.updateMany({ where: { id: quote.id, status: { in: ['SENT', 'VIEWED'] }, publicTokenHash: sha256(publicQuoteMatch[1]), version: quote.version, publicTokenExpiresAt: { gt: new Date() }, expiryDate: quote.expiryDate ? { gte: new Date() } : null }, data: { status: finalStatus, ...(finalStatus === 'ACCEPTED' ? { acceptedAt: new Date() } : { rejectedAt: new Date(), rejectionReason: String(body.reason || '').slice(0, 1000) }) } });
         if (!update.count) return false;
-        if (finalStatus === 'ACCEPTED') await tx.quoteAcceptance.create({ data: { quoteId: quote.id, quoteVersion: quote.version, name, email, statement: 'I agree to the quotation and terms.' } });
+        if (finalStatus === 'ACCEPTED') await tx.quoteAcceptance.create({ data: { quoteId: quote.id, quoteVersion: acceptedRevision, name, email, statement: 'I agree to the quotation and terms.' } });
         await tx.quoteEvent.create({ data: { quoteId: quote.id, type: finalStatus, metadata: finalStatus === 'REJECTED' ? { reason: String(body.reason || '').slice(0, 1000) } : undefined } });
         if (quote.rfqId) await tx.rFQ.updateMany({ where: { id: quote.rfqId, organizationId: quote.organizationId }, data: { status: finalStatus === 'ACCEPTED' ? 'WON' : 'LOST' } });
         return true;
@@ -234,6 +311,87 @@ export function createHandler(dependencies = {}) {
   const principal = await authenticate(event, prisma);
   if (!principal) return json(401, { error: 'Authentication required.' });
   const { user, organization, role } = principal;
+  if (path === '/billing' && method === 'GET') {
+    const monthStart = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1));
+    const [subscription, teamMembers, quotesThisMonth, aiRequestsThisMonth, storage, deletionRequest] = await Promise.all([
+      prisma.subscription.findUnique({ where: { organizationId: organization.id } }), prisma.membership.count({ where: { organizationId: organization.id } }),
+      prisma.quote.count({ where: { organizationId: organization.id, createdAt: { gte: monthStart }, deletedAt: null } }), prisma.aiUsage.count({ where: { organizationId: organization.id, createdAt: { gte: monthStart } } }),
+      prisma.attachment.aggregate({ where: { organizationId: organization.id, status: 'READY', deletedAt: null }, _sum: { byteSize: true } }),
+      prisma.organizationDeletionRequest.findFirst({ where: { organizationId: organization.id, canceledAt: null, completedAt: null }, orderBy: { requestedAt: 'desc' } })
+    ]);
+    return json(200, { subscription, entitlements: entitlementsFor(subscription, { teamMembers, quotesThisMonth, aiRequestsThisMonth, storageBytes: storage._sum.byteSize || 0 }), billingEnabled: config.stripe.enabled, deletionRequest });
+  }
+  if (path === '/billing/checkout' && method === 'POST') {
+    if (!['OWNER', 'ADMIN'].includes(role)) return json(403, { error: 'Only an Owner or Admin may manage billing.' });
+    if (!config.stripe.enabled) return json(503, { error: 'Billing is not configured for this deployment.' });
+    const plan = String(body.plan || '').toUpperCase(); if (!['PRO', 'BUSINESS'].includes(plan)) return json(400, { error: 'Choose the Pro or Business plan.' });
+    const billing = makeBilling(config); let subscription = await prisma.subscription.findUnique({ where: { organizationId: organization.id } });
+    let customerId = subscription?.stripeCustomerId;
+    if (!customerId) { const customer = await billing.createCustomer({ organizationId: organization.id, name: organization.name, email: user.email }); customerId = customer.id; subscription = await prisma.subscription.upsert({ where: { organizationId: organization.id }, create: { organizationId: organization.id, plan: 'FREE', status: 'ACTIVE', stripeCustomerId: customerId }, update: { stripeCustomerId: customerId } }); }
+    const session = await billing.createCheckout({ organizationId: organization.id, customerId, plan });
+    await prisma.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'billing.checkout_created', objectType: 'Subscription', objectId: subscription.id, metadata: { plan } } });
+    return json(200, { url: session.url });
+  }
+  if (path === '/billing/portal' && method === 'POST') {
+    if (!['OWNER', 'ADMIN'].includes(role)) return json(403, { error: 'Only an Owner or Admin may manage billing.' });
+    if (!config.stripe.enabled) return json(503, { error: 'Billing is not configured for this deployment.' });
+    const subscription = await prisma.subscription.findUnique({ where: { organizationId: organization.id } });
+    if (!subscription?.stripeCustomerId) return json(409, { error: 'This organization does not have a Stripe billing profile.' });
+    const session = await makeBilling(config).createPortal({ customerId: subscription.stripeCustomerId }); return json(200, { url: session.url });
+  }
+  if (path === '/account/export' && method === 'GET') {
+    if (role !== 'OWNER') return json(403, { error: 'Only the organization Owner may export all organization data.' });
+    const [settings, members, customers, catalogItems, rfqs, quotes, followUps, auditLogs, attachments, subscription] = await Promise.all([
+      prisma.companySettings.findUnique({ where: { organizationId: organization.id } }), prisma.membership.findMany({ where: { organizationId: organization.id }, include: { user: { select: { email: true } } } }),
+      prisma.customer.findMany({ where: { organizationId: organization.id } }), prisma.catalogItem.findMany({ where: { organizationId: organization.id } }), prisma.rFQ.findMany({ where: { organizationId: organization.id }, include: { items: true } }),
+      prisma.quote.findMany({ where: { organizationId: organization.id }, include: { items: true, events: true, acceptance: true, approvals: true } }), prisma.followUp.findMany({ where: { organizationId: organization.id } }),
+      prisma.auditLog.findMany({ where: { organizationId: organization.id }, orderBy: { createdAt: 'asc' } }), prisma.attachment.findMany({ where: { organizationId: organization.id } }), prisma.subscription.findUnique({ where: { organizationId: organization.id } })
+    ]);
+    await prisma.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'organization.data_exported', objectType: 'Organization', objectId: organization.id } });
+    return json(200, { exportedAt: new Date().toISOString(), organization, settings, members: members.map(m => ({ email: m.user.email, role: m.role, createdAt: m.createdAt })), customers, catalogItems, rfqs, quotes, followUps, auditLogs, attachments, subscription });
+  }
+  if (path === '/account/deletion-request' && method === 'POST') {
+    if (role !== 'OWNER') return json(403, { error: 'Only the organization Owner may request deletion.' });
+    const scheduledFor = new Date(Date.now() + 7 * 864e5), pending = await prisma.organizationDeletionRequest.findFirst({ where: { organizationId: organization.id, canceledAt: null, completedAt: null } });
+    if (pending) return json(200, { request: pending, duplicate: true });
+    const request = await prisma.organizationDeletionRequest.create({ data: { organizationId: organization.id, requestedById: user.id, scheduledFor } });
+    await prisma.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'organization.deletion_requested', objectType: 'Organization', objectId: organization.id, metadata: { scheduledFor: scheduledFor.toISOString() } } });
+    return json(202, { request, message: 'Deletion is scheduled after a seven-day cooling-off period. Export your data before the scheduled date.' });
+  }
+  if (path === '/account/deletion-request' && method === 'DELETE') {
+    if (role !== 'OWNER') return json(403, { error: 'Only the organization Owner may cancel deletion.' });
+    const canceled = await prisma.organizationDeletionRequest.updateMany({ where: { organizationId: organization.id, canceledAt: null, completedAt: null }, data: { canceledAt: new Date() } });
+    if (canceled.count) await prisma.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'organization.deletion_canceled', objectType: 'Organization', objectId: organization.id } });
+    return json(200, { canceled: Boolean(canceled.count) });
+  }
+
+  const quotePdfMatch = /^\/quotes\/([^/]+)\/pdf$/.exec(path);
+  if (quotePdfMatch && method === 'GET') {
+    const quote = await prisma.quote.findFirst({ where: { id: quotePdfMatch[1], organizationId: organization.id, deletedAt: null }, include: { items: { orderBy: { sortOrder: 'asc' } } } });
+    if (!quote || !quote.snapshot || !['SENT', 'VIEWED', 'ACCEPTED', 'REJECTED'].includes(quote.status)) return json(409, { error: 'Save and send the quote before generating its immutable customer PDF.' });
+    const pdf = await makePdf(quote, config.pdf); const fileName = `${quote.number}-v${quote.snapshot.version || quote.version}.pdf`;
+    if (config.storage.enabled) { const storage = makeStorage(config), key = storageKey(organization.id, '.pdf', 'generated-quotes'); await storage.put({ key, body: pdf, mimeType: 'application/pdf' }); await prisma.attachment.upsert({ where: { organizationId_storageKey: { organizationId: organization.id, storageKey: key } }, create: { organizationId: organization.id, quoteId: quote.id, storageKey: key, kind: 'QUOTE_PDF', status: 'READY', provider: config.storage.provider, fileName, mimeType: 'application/pdf', byteSize: pdf.length, sha256: sha256(pdf) }, update: { status: 'READY', byteSize: pdf.length, sha256: sha256(pdf) } }).catch(async () => prisma.attachment.create({ data: { organizationId: organization.id, quoteId: quote.id, storageKey: key, kind: 'QUOTE_PDF', status: 'READY', provider: config.storage.provider, fileName, mimeType: 'application/pdf', byteSize: pdf.length, sha256: sha256(pdf) } })); }
+    await prisma.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'quote.pdf_generated', objectType: 'Quote', objectId: quote.id, metadata: { version: quote.snapshot.version || quote.version } } });
+    return binary(200, pdf, 'application/pdf', fileName);
+  }
+
+  if (path === '/attachments/upload' && method === 'POST') {
+    if (!['OWNER', 'ADMIN', 'SALES_MANAGER', 'SALES_REP'].includes(role)) return json(403, { error: 'Read-only role.' });
+    if (!config.storage.enabled) return json(503, { error: 'Object storage is not configured.' });
+    let file; try { file = validateUpload(body, config.storage.maxUploadBytes); } catch (error) { return json(400, { error: error.message }); }
+    const rfqId = body.rfqId ? String(body.rfqId) : null; if (rfqId && !await prisma.rFQ.findFirst({ where: { id: rfqId, organizationId: organization.id, deletedAt: null } })) return json(404, { error: 'RFQ not found.' });
+    const subscription = await prisma.subscription.findUnique({ where: { organizationId: organization.id } }), used = await prisma.attachment.aggregate({ where: { organizationId: organization.id, deletedAt: null }, _sum: { byteSize: true } }), entitlement = entitlementsFor(subscription, { storageBytes: used._sum.byteSize || 0 });
+    if (file.byteSize > entitlement.available.storageBytes) return json(402, { error: 'Organization storage quota would be exceeded.' });
+    const key = storageKey(organization.id, file.extension), attachment = await prisma.attachment.create({ data: { organizationId: organization.id, rfqId, storageKey: key, provider: config.storage.provider, fileName: file.fileName, mimeType: file.mimeType, byteSize: file.byteSize, sha256: /^[a-f0-9]{64}$/i.test(body.sha256 || '') ? body.sha256.toLowerCase() : 'pending' } });
+    const uploadUrl = await makeStorage(config).createUploadUrl({ key, mimeType: file.mimeType, byteSize: file.byteSize }); return json(201, { attachment: { id: attachment.id, fileName: attachment.fileName, status: attachment.status }, uploadUrl, expiresIn: 900 });
+  }
+  const attachmentMatch = /^\/attachments\/([^/]+)(?:\/(complete|download))?$/.exec(path);
+  if (attachmentMatch) {
+    const attachment = await prisma.attachment.findFirst({ where: { id: attachmentMatch[1], organizationId: organization.id, deletedAt: null } }); if (!attachment) return json(404, { error: 'Attachment not found.' });
+    if (attachmentMatch[2] === 'complete' && method === 'POST') { if (!config.storage.enabled) return json(503, { error: 'Object storage is not configured.' }); try { const result = await makeStorage(config).verify(attachment); const changed = await prisma.attachment.update({ where: { id: attachment.id }, data: { status: 'READY', sha256: /^[a-f0-9]{64}$/i.test(body.sha256 || '') ? body.sha256.toLowerCase() : attachment.sha256 } }); return json(200, { attachment: { id: changed.id, fileName: changed.fileName, status: changed.status, etag: result.etag } }); } catch (error) { await prisma.attachment.update({ where: { id: attachment.id }, data: { status: 'REJECTED' } }).catch(() => {}); return json(400, { error: error.message }); } }
+    if (attachmentMatch[2] === 'download' && method === 'GET') { if (attachment.status !== 'READY') return json(409, { error: 'Attachment is not ready.' }); return json(200, { url: await makeStorage(config).createDownloadUrl(attachment.storageKey), expiresIn: 300 }); }
+    if (!attachmentMatch[2] && method === 'DELETE') { if (!['OWNER', 'ADMIN', 'SALES_MANAGER'].includes(role)) return json(403, { error: 'Only managers may delete attachments.' }); await makeStorage(config).delete(attachment.storageKey); await prisma.attachment.update({ where: { id: attachment.id }, data: { deletedAt: new Date(), status: 'DELETED' } }); return json(200, { deleted: true }); }
+  }
   if (path === '/auth/me' && method === 'GET') {
     const memberships = await prisma.membership.findMany({ where: { userId: user.id }, include: { organization: { select: { id: true, name: true, reportingCurrency: true } } }, orderBy: { createdAt: 'asc' } });
     return json(200, { user: { id: user.id, email: user.email }, organization: { id: organization.id, name: organization.name, currency: organization.reportingCurrency }, role, memberships: memberships.map(m => ({ organizationId: m.organizationId, name: m.organization.name, role: m.role })) });
@@ -248,17 +406,34 @@ export function createHandler(dependencies = {}) {
     await prisma.auditLog.create({ data: { organizationId, actorUserId: user.id, action: 'auth.organization_switched', objectType: 'Organization', objectId: organizationId, metadata: { previousOrganizationId: organization.id } } });
     return json(200, { organization: { id: membership.organization.id, name: membership.organization.name, currency: membership.organization.reportingCurrency }, role: membership.role });
   }
-  if (path === '/bootstrap' && method === 'GET') {
-    const [settings, customers, catalogItems, rfqs, quotes, followUps] = await Promise.all([
+  if (path === '/auth/change-password' && method === 'POST') {
+    const currentPassword = body.currentPassword, nextPassword = body.newPassword;
+    if (typeof currentPassword !== 'string' || typeof nextPassword !== 'string' || nextPassword.length < 12 || nextPassword.length > 256 || currentPassword === nextPassword) return json(400, { error: 'Enter your current password and a different new password of 12–256 characters.' });
+    const [saltHex, expectedHex] = user.passwordHash.split(':'), expected = Buffer.from(expectedHex || '', 'hex');
+    if (!saltHex || !expected.length) return json(409, { error: 'This account password cannot be changed through this method.' });
+    const actual = Buffer.from(await scrypt(currentPassword, Buffer.from(saltHex, 'hex'), 64));
+    if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return json(401, { error: 'Current password is incorrect.' });
+    const salt = randomBytes(16), passwordHash = `${salt.toString('hex')}:${Buffer.from(await scrypt(nextPassword, salt, 64)).toString('hex')}`;
+    await prisma.$transaction(async tx => { await tx.user.update({ where: { id: user.id }, data: { passwordHash } }); await tx.session.deleteMany({ where: { userId: user.id, id: { not: principal.session.id } } }); await tx.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'auth.password_changed', objectType: 'User', objectId: user.id } }); });
+    return json(200, { changed: true, otherSessionsRevoked: true });
+  }
+  if (path === '/auth/logout-other-sessions' && method === 'POST') {
+    const removed = await prisma.session.deleteMany({ where: { userId: user.id, id: { not: principal.session.id } } });
+    await prisma.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'auth.other_sessions_revoked', objectType: 'User', objectId: user.id, metadata: { count: removed.count } } });
+    return json(200, { revoked: removed.count });
+  }
+    if (path === '/bootstrap' && method === 'GET') {
+    const [settings, customers, catalogItems, rfqs, quotes, followUps, events] = await Promise.all([
       prisma.companySettings.findUnique({ where: { organizationId: organization.id } }),
       prisma.customer.findMany({ where: { organizationId: organization.id, deletedAt: null }, orderBy: { createdAt: 'desc' } }),
       prisma.catalogItem.findMany({ where: { organizationId: organization.id, deletedAt: null }, orderBy: { createdAt: 'desc' } }),
       prisma.rFQ.findMany({ where: { organizationId: organization.id, deletedAt: null }, include: { items: true }, orderBy: { createdAt: 'desc' } }),
       prisma.quote.findMany({ where: { organizationId: organization.id, deletedAt: null }, include: { items: { orderBy: { sortOrder: 'asc' } } }, orderBy: { createdAt: 'desc' } }),
-      prisma.followUp.findMany({ where: { organizationId: organization.id, deletedAt: null }, orderBy: { dueAt: 'asc' } })
+      prisma.followUp.findMany({ where: { organizationId: organization.id, deletedAt: null }, orderBy: { dueAt: 'asc' } }),
+      prisma.quoteEvent.findMany({ where: { quote: { organizationId: organization.id, deletedAt: null } }, include: { quote: { select: { id: true, number: true } } }, orderBy: { createdAt: 'desc' }, take: 500 })
     ]);
     const statusLabel = value => ({ DRAFT: 'Draft', INTERNAL_REVIEW: 'Internal Review', SENDING: 'Sending', SENT: 'Sent', VIEWED: 'Viewed', ACCEPTED: 'Accepted', REJECTED: 'Rejected', EXPIRED: 'Expired', NEW: 'New', REVIEWING: 'Reviewing', PRICING: 'Pricing', QUOTED: 'Quoted', WON: 'Won', LOST: 'Lost', CANCELLED: 'Cancelled', PENDING: 'Pending', COMPLETED: 'Completed', SNOOZED: 'Snoozed' })[value] || value;
-    return json(200, { user: { id: user.id, email: user.email, role }, organization: { id: organization.id, name: organization.name, currency: organization.reportingCurrency }, settings: settings?.data || {}, customers: customers.map(item => ({ ...item, name: item.companyName, contact: item.contactName })), products: catalogItems.map(item => ({ ...item, price: Number(item.sellingPrice), cost: Number(item.cost), tax: Number(item.taxRate) })), rfqs: rfqs.map(item => ({ ...item, received: item.receivedAt.toISOString().slice(0, 10), deadline: item.deadline?.toISOString().slice(0, 10) || '', status: statusLabel(item.status), items: item.items.map(line => ({ catalogItemId: line.catalogItemId, name: line.description, description: line.notes || '', qty: Number(line.quantity), unit: line.unit, sourceText: line.sourceText, confidence: Number(line.confidence) || 0 })) })), quotes: quotes.map(item => ({ ...item, created: item.issueDate.toISOString().slice(0, 10), expiry: item.expiryDate?.toISOString().slice(0, 10) || '', payment: item.paymentTerms, delivery: item.deliveryTerms, notes: item.customerNotes, status: statusLabel(item.status), discount: Number(item.discount), items: item.items.map(line => ({ catalogItemId: line.catalogItemId, name: line.nameSnapshot, sku: line.skuSnapshot, description: line.descriptionSnapshot, qty: Number(line.quantity), unit: line.unitSnapshot, cost: Number(line.costSnapshot), price: Number(line.sellingPrice), tax: Number(line.taxRate) })) })), followups: followUps.map(item => ({ ...item, title: item.task, due: item.dueAt.toISOString().slice(0, 10), note: item.notes, status: statusLabel(item.status) })), events: [] });
+    return json(200, { user: { id: user.id, email: user.email, role }, organization: { id: organization.id, name: organization.name, currency: organization.reportingCurrency }, settings: settings?.data || {}, customers: customers.map(item => ({ ...item, name: item.companyName, contact: item.contactName })), products: catalogItems.map(item => ({ ...item, price: Number(item.sellingPrice), cost: Number(item.cost), tax: Number(item.taxRate) })), rfqs: rfqs.map(item => ({ ...item, received: item.receivedAt.toISOString().slice(0, 10), deadline: item.deadline?.toISOString().slice(0, 10) || '', status: statusLabel(item.status), items: item.items.map(line => ({ catalogItemId: line.catalogItemId, name: line.description, description: line.notes || '', qty: Number(line.quantity), unit: line.unit, sourceText: line.sourceText, confidence: Number(line.confidence) || 0 })) })), quotes: quotes.map(item => ({ ...item, created: item.issueDate.toISOString().slice(0, 10), expiry: item.expiryDate?.toISOString().slice(0, 10) || '', payment: item.paymentTerms, delivery: item.deliveryTerms, notes: item.customerNotes, status: statusLabel(item.status), discount: Number(item.discount), items: item.items.map(line => ({ catalogItemId: line.catalogItemId, lineType: line.catalogItemId ? 'CATALOG' : 'MANUAL', name: line.nameSnapshot, sku: line.skuSnapshot, description: line.descriptionSnapshot, qty: Number(line.quantity), unit: line.unitSnapshot, cost: Number(line.costSnapshot), price: Number(line.sellingPrice), minimumPrice: line.minimumPriceSnapshot == null ? null : Number(line.minimumPriceSnapshot), tax: Number(line.taxRate) })) })), followups: followUps.map(item => ({ ...item, title: item.task, due: item.dueAt.toISOString().slice(0, 10), note: item.notes, status: statusLabel(item.status) })), events: events.map(event => ({ ...event, number: event.quote.number })) });
   }
   if (path === '/customers' && method === 'GET') return json(200, { items: await prisma.customer.findMany({ where: { organizationId: organization.id, deletedAt: null }, orderBy: { createdAt: 'desc' } }) });
   if (path === '/customers' && method === 'POST') {
@@ -275,9 +450,26 @@ export function createHandler(dependencies = {}) {
   }
   if (path === '/products' && method === 'POST') {
     if (!['OWNER', 'ADMIN', 'SALES_MANAGER'].includes(role)) return json(403, { error: 'Catalog changes require a manager role.' });
-    const name = String(body.name || '').trim(), cost = Number(body.cost), price = Number(body.price ?? body.sellingPrice), tax = Number(body.tax ?? body.taxRate ?? 0);
-    if (!name || name.length > 240 || !Number.isFinite(cost) || cost < 0 || !Number.isFinite(price) || price < 0 || !Number.isFinite(tax) || tax < 0 || tax > 100) return json(400, { error: 'Catalog item name, cost, price and tax are invalid.' });
-    const data = { name, sku: String(body.sku || '').slice(0, 80) || null, description: String(body.description || '').slice(0, 2000) || null, category: String(body.category || '').slice(0, 100) || null, unit: String(body.unit || 'each').slice(0, 40), cost: cost.toFixed(4), sellingPrice: price.toFixed(4), taxRate: tax.toFixed(4), currency: String(body.currency || organization.reportingCurrency).slice(0, 3).toUpperCase() };
+    const name = String(body.name || '').trim(), costInput = body.cost, priceInput = body.price ?? body.sellingPrice;
+    const companySettings = await prisma.companySettings.findUnique({ where: { organizationId: organization.id } });
+    const taxInput = body.tax ?? body.taxRate ?? companySettings?.data?.tax ?? 0;
+    const cost = Number(costInput), price = Number(priceInput), tax = Number(taxInput);
+    if (!name || name.length > 240 || costInput == null || priceInput == null || !Number.isFinite(cost) || cost < 0 || !Number.isFinite(price) || price < 0 || !Number.isFinite(tax) || tax < 0 || tax > 100) return json(400, { error: 'Catalog item name, cost, price and tax are invalid.' });
+    try { calculateQuote({ items: [{ qty: '1', cost: costInput, price: priceInput, tax: taxInput }], discount: 0 }); }
+    catch (error) { return json(400, { error: error.message }); }
+    const currency = String(body.currency || organization.reportingCurrency).trim().toUpperCase();
+    const minimumInput = body.minimumPrice == null || body.minimumPrice === '' ? null : body.minimumPrice;
+    if (!validCurrency(currency)) return json(400, { error: 'Catalog currency is invalid.' });
+      if (minimumInput != null) {
+      try { calculateQuote({ items: [{ qty: '1', cost: '0', price: minimumInput, tax: '0' }], discount: 0 }); }
+      catch (error) { return json(400, { error: error.message }); }
+      try { calculateQuote({ items: [{ qty: '1', cost: '0', price: priceInput, tax: '0' }, { qty: '1', cost: '0', price: minimumInput, tax: '0' }], discount: 0 }); }
+      catch (error) { return json(400, { error: error.message }); }
+      if (amountScaled(minimumInput) > amountScaled(priceInput)) return json(400, { error: 'Minimum price cannot exceed the selling price.' });
+    }
+    const minimumPrice = minimumInput == null ? null : Number(minimumInput);
+    if (minimumPrice != null && amountScaled(priceInput) < amountScaled(minimumInput)) return json(400, { error: 'Selling price cannot be below the minimum price.' });
+    const data = { name, sku: String(body.sku || '').slice(0, 80) || null, description: String(body.description || '').slice(0, 2000) || null, category: String(body.category || '').slice(0, 100) || null, unit: String(body.unit || 'each').slice(0, 40), cost: cost.toFixed(4), sellingPrice: price.toFixed(4), minimumPrice: minimumPrice?.toFixed(4) ?? null, taxRate: tax.toFixed(4), currency, active: body.active !== false };
     let item;
     if (body.id) {
       const current = await prisma.catalogItem.findFirst({ where: { id: String(body.id), organizationId: organization.id, deletedAt: null } });
@@ -295,7 +487,7 @@ export function createHandler(dependencies = {}) {
     if (!customer) return json(404, { error: 'Customer not found in this organization.' });
     const statuses = { New: 'NEW', Reviewing: 'REVIEWING', Pricing: 'PRICING', Quoted: 'QUOTED', Won: 'WON', Lost: 'LOST', Expired: 'EXPIRED', Cancelled: 'CANCELLED' };
     const data = { title, customerId, deadline: body.deadline ? new Date(`${body.deadline}T23:59:59.999Z`) : null, priority: ['Normal', 'High', 'Urgent'].includes(body.priority) ? body.priority : 'Normal', status: statuses[body.status] || 'NEW', source: String(body.source || 'Manual').slice(0, 100), notes: String(body.notes || '').slice(0, 10000) || null };
-    if (body.id) {
+    if (body.id && !body.sourceQuoteId) {
       const prior = await prisma.rFQ.findFirst({ where: { id: String(body.id), organizationId: organization.id, deletedAt: null } });
       if (!prior) return json(404, { error: 'RFQ not found in this organization.' });
       const item = await prisma.rFQ.update({ where: { id: prior.id }, data });
@@ -357,7 +549,7 @@ export function createHandler(dependencies = {}) {
   if (path === '/team' && method === 'GET') {
     if (!['OWNER', 'ADMIN', 'SALES_MANAGER'].includes(role)) return json(403, { error: 'Team access is not permitted.' });
     const members = await prisma.membership.findMany({ where: { organizationId: organization.id }, include: { user: { select: { email: true } } }, orderBy: { createdAt: 'asc' } });
-    return json(200, { members: members.map(member => ({ email: member.user.email, role: member.role, createdAt: member.createdAt })) });
+    return json(200, { members: members.map(member => ({ userId: member.userId, email: member.user.email, role: member.role, createdAt: member.createdAt })) });
   }
   if (path === '/team/invite' && method === 'POST') {
     if (!['OWNER', 'ADMIN', 'SALES_MANAGER'].includes(role)) return json(403, { error: 'Team access is not permitted.' });
@@ -366,6 +558,8 @@ export function createHandler(dependencies = {}) {
     if (!/^\\S+@\\S+\\.\\S+$/.test(email) || email.length > 254) return json(400, { error: 'Enter a valid email address.' });
     if (!['ADMIN', 'SALES_MANAGER', 'SALES_REP', 'VIEWER'].includes(requestedRole)) return json(400, { error: 'Choose an assignable team role.' });
     if (requestedRole === 'ADMIN' && role !== 'OWNER') return json(403, { error: 'Only an Owner may invite an Admin.' });
+    const [subscription, memberCount] = await Promise.all([prisma.subscription.findUnique({ where: { organizationId: organization.id } }), prisma.membership.count({ where: { organizationId: organization.id } })]);
+    if (memberCount >= entitlementsFor(subscription, { teamMembers: memberCount }).limits.teamMembers) return json(402, { error: 'Your plan team-member limit has been reached.' });
     const emailProvider = makeEmail(config);
     if (!emailProvider) return json(503, { error: 'Email delivery must be configured before sending an invitation.' });
     const existing = await prisma.membership.findFirst({ where: { organizationId: organization.id, user: { email } } });
@@ -404,77 +598,149 @@ export function createHandler(dependencies = {}) {
     }
     return json(200, { organization: { id: invitation.organization.id, name: invitation.organization.name }, role: invitation.role });
   }
+  const memberMatch = /^\/team\/([^/]+)$/.exec(path);
+  if (memberMatch && ['PATCH', 'DELETE'].includes(method)) {
+    if (!['OWNER', 'ADMIN'].includes(role)) return json(403, { error: 'Only an Owner or Admin may change team membership.' });
+    const target = await prisma.membership.findUnique({ where: { userId_organizationId: { userId: memberMatch[1], organizationId: organization.id } } });
+    if (!target) return json(404, { error: 'Team member not found.' });
+    if (target.role === 'OWNER') return json(409, { error: 'Organization ownership must be transferred before changing or removing the Owner.' });
+    if (role !== 'OWNER' && target.role === 'ADMIN') return json(403, { error: 'Only the Owner may change or remove an Admin.' });
+    if (method === 'DELETE') {
+      await prisma.$transaction(async tx => { await tx.membership.delete({ where: { userId_organizationId: { userId: target.userId, organizationId: organization.id } } }); await tx.session.deleteMany({ where: { userId: target.userId, organizationId: organization.id } }); await tx.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'team.member_removed', objectType: 'User', objectId: target.userId, metadata: { previousRole: target.role } } }); });
+      return json(200, { removed: true });
+    }
+    const requestedRole = String(body.role || '').toUpperCase();
+    if (!['ADMIN', 'SALES_MANAGER', 'SALES_REP', 'VIEWER'].includes(requestedRole)) return json(400, { error: 'Choose a valid role.' });
+    if (requestedRole === 'ADMIN' && role !== 'OWNER') return json(403, { error: 'Only the Owner may assign an Admin.' });
+    const updated = await prisma.$transaction(async tx => { const membership = await tx.membership.update({ where: { userId_organizationId: { userId: target.userId, organizationId: organization.id } }, data: { role: requestedRole } }); await tx.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'team.role_changed', objectType: 'User', objectId: target.userId, metadata: { from: target.role, to: requestedRole } } }); return membership; });
+    return json(200, { member: { userId: updated.userId, role: updated.role } });
+  }
   if (path === '/quotes' && method === 'GET') {
     const items = await prisma.quote.findMany({ where: { organizationId: organization.id, deletedAt: null }, include: { items: { orderBy: { sortOrder: 'asc' } } }, orderBy: { createdAt: 'desc' } });
     return json(200, { items: items.map(quoteDTO) });
   }
   if (path === '/quotes' && method === 'POST') {
     if (!['OWNER', 'ADMIN', 'SALES_MANAGER', 'SALES_REP'].includes(role)) return json(403, { error: 'Read-only role.' });
+    if (body.sourceQuoteId && body.id) return json(400, { error: 'A revision must create a separate quote record.' });
     const title = String(body.title || '').trim(), customerId = String(body.customerId || ''), requested = Array.isArray(body.items) ? body.items : [];
     if (!title || title.length > 200 || !customerId || !requested.length || requested.length > 200) return json(400, { error: 'Quote title, customer and at least one line are required.' });
+    if (body.sourceQuoteId && !body.currency) {
+      const source = await prisma.quote.findFirst({ where: { id: String(body.sourceQuoteId), organizationId: organization.id, deletedAt: null }, select: { currency: true } });
+      if (!source) return json(404, { error: 'Source quote not found in this organization.' });
+      body.currency = source.currency;
+    }
+    const currency = String(body.currency || organization.reportingCurrency).trim().toUpperCase();
+    if (!validCurrency(currency)) return json(400, { error: 'Quote currency is invalid.' });
+    const catalogIds = [...new Set(requested.map(line => String(line?.catalogItemId || '').trim()).filter(Boolean))];
     const [customer, rfq, catalog] = await Promise.all([
       prisma.customer.findFirst({ where: { id: customerId, organizationId: organization.id, deletedAt: null } }),
       body.rfqId ? prisma.rFQ.findFirst({ where: { id: String(body.rfqId), organizationId: organization.id, deletedAt: null } }) : Promise.resolve(null),
-      prisma.catalogItem.findMany({ where: { organizationId: organization.id, id: { in: [...new Set(requested.map(line => String(line.catalogItemId || '')))] }, active: true, deletedAt: null } })
+      catalogIds.length ? prisma.catalogItem.findMany({ where: { organizationId: organization.id, id: { in: catalogIds }, active: true, deletedAt: null } }) : Promise.resolve([])
     ]);
     if (!customer) return json(404, { error: 'Customer not found in this organization.' });
     if (body.rfqId && !rfq) return json(404, { error: 'RFQ not found in this organization.' });
-    if (catalog.length !== new Set(requested.map(line => String(line.catalogItemId || ''))).size) return json(400, { error: 'Every quote line must reference an active catalog item in this organization.' });
-    const catalogById = new Map(catalog.map(item => [item.id, item]));
+    let prior = null;
+    if (body.sourceQuoteId) {
+      const sourceQuote = await prisma.quote.findFirst({ where: { id: String(body.sourceQuoteId), organizationId: organization.id, deletedAt: null } });
+      if (!sourceQuote) return json(404, { error: 'Source quote not found in this organization.' });
+      if (sourceQuote.currency !== currency) return json(400, { error: 'A duplicate must retain the source quote currency.' });
+      if (customerId !== sourceQuote.customerId) return json(400, { error: 'A duplicate must retain the source quote customer.' });
+      if (!body.rfqId && sourceQuote.rfqId) body.rfqId = sourceQuote.rfqId;
+      if (!body.expiry) body.expiry = new Date(Date.now() + Number((await prisma.companySettings.findUnique({ where: { organizationId: organization.id } }))?.quoteValidityDays || 30) * 864e5).toISOString().slice(0, 10);
+    }
+    if (body.id && !body.sourceQuoteId) {
+      prior = await prisma.quote.findFirst({ where: { id: String(body.id), organizationId: organization.id, deletedAt: null }, include: { items: true } });
+      if (!prior) return json(404, { error: 'Quote not found in this organization.' });
+      if (!body.sourceQuoteId && !['DRAFT', 'INTERNAL_REVIEW'].includes(prior.status)) return json(409, { error: 'Sent quotes are immutable. Create a new revision instead.' });
+      if (!body.sourceQuoteId && body.version != null && Number(body.version) !== prior.version) return json(409, { error: 'This quote changed since you opened it. Reload and review the latest version.' });
+      if (role === 'SALES_REP' && prior.items.some(item => item.catalogItemId) && requested.some(line => !line.catalogItemId)) return json(403, { error: 'A Sales Representative cannot replace catalog lines with manually priced lines.' });
+      const priorItems = new Map(prior.items.map(item => [item.id, item]));
+      for (const line of requested) if (!body.sourceQuoteId && line.id) {
+        const original = priorItems.get(String(line.id));
+        if (!original) return json(400, { error: 'A quote line does not belong to this draft.' });
+        if (original.catalogItemId && line.catalogItemId !== original.catalogItemId) return json(403, { error: 'A catalog-backed line cannot be converted to a manual line.' });
+      }
+    }
     let lines;
     try {
-      lines = requested.map((line, index) => {
-        const source = catalogById.get(String(line.catalogItemId));
-        const quantity = Number(line.quantity ?? line.qty), price = Number(line.sellingPrice ?? line.price ?? source.sellingPrice);
-        if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price) || price < 0) throw new Error('invalid');
-        if (source.minimumPrice && price < Number(source.minimumPrice)) throw new Error('minimum');
-        return { catalogItemId: source.id, name: source.name, sku: source.sku || '', description: String(line.description ?? source.description ?? '').slice(0, 2000), qty: quantity, unit: source.unit, cost: Number(source.cost), price, tax: Number(source.taxRate), sortOrder: index };
-      });
-    } catch (error) { return json(400, { error: error.message === 'minimum' ? 'A line price is below the catalog minimum.' : 'Quote line quantity or price is invalid.' }); }
+      lines = normalizeQuoteLines(requested, catalog, currency, { enforceMinimum: role !== 'SALES_REP' });
+    } catch (error) { return json(400, { error: error.message || 'Quote line values are invalid.' }); }
     let totals;
     try { totals = calculateQuote({ items: lines, discount: body.discount ?? 0 }); }
     catch (error) { return json(400, { error: error.message }); }
     const settings = await prisma.companySettings.findUnique({ where: { organizationId: organization.id } });
     const minimumMargin = Number(settings?.minMargin ?? settings?.data?.margin ?? 20);
     const marginMode = settings?.marginMode || settings?.data?.marginMode || 'WARNING';
+    const belowMinimumPrice = lines.some(line => line.minimumPrice != null && amountScaled(line.price) < amountScaled(line.minimumPrice));
+    if (belowMinimumPrice && !(role === 'SALES_REP' && marginMode === 'APPROVAL_REQUIRED')) return json(409, { error: 'Selling price cannot be below the catalog minimum.' });
     if (totals.margin < minimumMargin && marginMode === 'BLOCK') return json(409, { error: 'Quote is below the configured minimum margin.' });
-    const status = totals.margin < minimumMargin && marginMode === 'APPROVAL_REQUIRED' && role === 'SALES_REP' ? 'INTERNAL_REVIEW' : 'DRAFT';
-    const currency = String(body.currency || organization.reportingCurrency).slice(0, 3).toUpperCase();
+    const requiresApproval = (totals.margin < minimumMargin || belowMinimumPrice) && marginMode === 'APPROVAL_REQUIRED';
+    const status = requiresApproval ? 'INTERNAL_REVIEW' : 'DRAFT';
     const expiryDate = body.expiry ? new Date(`${body.expiry}T23:59:59.999Z`) : null;
     if (expiryDate && !Number.isFinite(expiryDate.getTime())) return json(400, { error: 'Quote expiry date is invalid.' });
-    if (body.id) {
-      const prior = await prisma.quote.findFirst({ where: { id: String(body.id), organizationId: organization.id, deletedAt: null } });
-      if (!prior) return json(404, { error: 'Quote not found in this organization.' });
-      if (!['DRAFT', 'INTERNAL_REVIEW'].includes(prior.status)) return json(409, { error: 'Sent quotes are immutable. Create a revised quote instead.' });
-      if (body.version != null && Number(body.version) !== prior.version) return json(409, { error: 'This quote changed since you opened it. Reload and review the latest version.' });
+    if (body.id && !body.sourceQuoteId) {
       const changed = await prisma.$transaction(async tx => {
-        const result = await tx.quote.updateMany({ where: { id: prior.id, organizationId: organization.id, status: prior.status, version: prior.version }, data: { title, customerId, rfqId: rfq?.id || null, currency, discount: Number(body.discount || 0).toFixed(4), expiryDate, paymentTerms: String(body.paymentTerms || body.payment || '').slice(0, 500) || null, deliveryTerms: String(body.deliveryTerms || body.delivery || '').slice(0, 500) || null, customerNotes: String(body.customerNotes || body.notes || '').slice(0, 2000) || null, version: { increment: 1 } } });
+        const result = await tx.quote.updateMany({ where: { id: prior.id, organizationId: organization.id, status: prior.status, version: prior.version }, data: { title, customerId, rfqId: rfq?.id || null, currency, discount: Number(body.discount || 0).toFixed(4), expiryDate, paymentTerms: String(body.paymentTerms || body.payment || '').slice(0, 500) || null, deliveryTerms: String(body.deliveryTerms || body.delivery || '').slice(0, 500) || null, customerNotes: String(body.customerNotes || body.notes || '').slice(0, 2000) || null, status, version: { increment: 1 } } });
         if (!result.count) return false;
         await tx.quoteItem.deleteMany({ where: { quoteId: prior.id } });
-        await tx.quoteItem.createMany({ data: lines.map(line => ({ quoteId: prior.id, catalogItemId: line.catalogItemId, nameSnapshot: line.name, skuSnapshot: line.sku, descriptionSnapshot: line.description, quantity: line.qty.toFixed(4), unitSnapshot: line.unit, costSnapshot: line.cost.toFixed(4), sellingPrice: line.price.toFixed(4), taxRate: line.tax.toFixed(4), sortOrder: line.sortOrder })) });
+        await tx.quoteItem.createMany({ data: lines.map(line => ({ quoteId: prior.id, ...quoteItemData(line) })) });
+        if (prior.status === 'INTERNAL_REVIEW' || requiresApproval) {
+          await tx.quoteApproval.deleteMany({ where: { quoteId: prior.id } });
+          await tx.quoteEvent.create({ data: { quoteId: prior.id, type: 'APPROVAL_INVALIDATED', actorUserId: user.id, metadata: { reason: 'financial-edit' } } });
+        }
+        if (requiresApproval) await tx.quoteApproval.deleteMany({ where: { quoteId: prior.id } });
         await tx.quoteEvent.create({ data: { quoteId: prior.id, type: 'DRAFT_REVISED', actorUserId: user.id } });
         return tx.quote.findUnique({ where: { id: prior.id }, include: { items: { orderBy: { sortOrder: 'asc' } } } });
       });
       if (!changed) return json(409, { error: 'This quote changed while you were saving. Reload and review the latest version.' });
       return json(200, { item: quoteDTO(changed), totals, warning: totals.margin < minimumMargin && marginMode === 'WARNING' ? 'Quote is below the configured margin guideline.' : null });
     }
+    const monthStart = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1));
+    const [subscription, quoteCount] = await Promise.all([prisma.subscription.findUnique({ where: { organizationId: organization.id } }), prisma.quote.count({ where: { organizationId: organization.id, createdAt: { gte: monthStart }, deletedAt: null } })]);
+    if (quoteCount >= entitlementsFor(subscription, { quotesThisMonth: quoteCount }).limits.quotesPerMonth) return json(402, { error: 'Your plan monthly quotation limit has been reached.' });
     const quote = await prisma.$transaction(async tx => {
       const counter = await tx.companySettings.update({ where: { organizationId: organization.id }, data: { quoteCounter: { increment: 1 } } });
       const number = `Q-${new Date().getUTCFullYear()}-${String(counter.quoteCounter).padStart(5, '0')}`;
-      const created = await tx.quote.create({ data: { organizationId: organization.id, number, customerId, rfqId: rfq?.id || null, title, status, currency, discount: Number(body.discount || 0).toFixed(4), expiryDate, paymentTerms: String(body.paymentTerms || body.payment || '').slice(0, 500) || null, deliveryTerms: String(body.deliveryTerms || body.delivery || '').slice(0, 500) || null, customerNotes: String(body.customerNotes || body.notes || '').slice(0, 2000) || null, version: 1, items: { create: lines.map(line => ({ catalogItemId: line.catalogItemId, nameSnapshot: line.name, skuSnapshot: line.sku, descriptionSnapshot: line.description, quantity: line.qty.toFixed(4), unitSnapshot: line.unit, costSnapshot: line.cost.toFixed(4), sellingPrice: line.price.toFixed(4), taxRate: line.tax.toFixed(4), sortOrder: line.sortOrder })) } }, include: { items: { orderBy: { sortOrder: 'asc' } } } });
+      const created = await tx.quote.create({ data: { organizationId: organization.id, createdById: user.id, sourceQuoteId: body.sourceQuoteId || null, number, customerId, rfqId: rfq?.id || null, title, status, currency, discount: Number(body.discount || 0).toFixed(4), expiryDate, paymentTerms: String(body.paymentTerms || body.payment || '').slice(0, 500) || null, deliveryTerms: String(body.deliveryTerms || body.delivery || '').slice(0, 500) || null, customerNotes: String(body.customerNotes || body.notes || '').slice(0, 2000) || null, version: 1, items: { create: lines.map(line => ({ ...quoteItemData(line) })) } }, include: { items: { orderBy: { sortOrder: 'asc' } } } });
       await tx.quoteEvent.create({ data: { quoteId: created.id, type: 'CREATED', actorUserId: user.id } });
       await tx.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'quote.created', objectType: 'Quote', objectId: created.id } });
       return created;
     });
     return json(201, { item: quoteDTO(quote), totals, warning: totals.margin < minimumMargin && marginMode === 'WARNING' ? 'Quote is below the configured margin guideline.' : null });
   }
+  const approveMatch = /^\/quotes\/([^/]+)\/approve$/.exec(path);
+  if (approveMatch && method === 'POST') {
+    if (!['OWNER', 'ADMIN', 'SALES_MANAGER'].includes(role)) return json(403, { error: 'Only an Owner, Admin or Sales Manager may approve a quote.' });
+    const quote = await prisma.quote.findFirst({ where: { id: approveMatch[1], organizationId: organization.id, deletedAt: null }, include: { items: { orderBy: { sortOrder: 'asc' } } } });
+    if (!quote || !['DRAFT', 'INTERNAL_REVIEW'].includes(quote.status)) return json(409, { error: 'Only an editable quote can be approved.' });
+    if (quote.createdById === user.id && role === 'SALES_MANAGER') return json(403, { error: 'A salesperson cannot self-approve this quote.' });
+    if (quote.createdById === user.id && ['OWNER', 'ADMIN'].includes(role)) return json(403, { error: 'The quote creator cannot approve their own quote.' });
+    const financialHash = financialFingerprint(quote);
+    const approval = await prisma.$transaction(async tx => {
+      const created = await tx.quoteApproval.create({ data: { quoteId: quote.id, quoteVersion: quote.version, approverUserId: user.id, financialHash } });
+      await tx.quoteEvent.create({ data: { quoteId: quote.id, type: 'APPROVED', actorUserId: user.id, metadata: { version: quote.version, financialHash } } });
+      await tx.auditLog.create({ data: { organizationId: organization.id, actorUserId: user.id, action: 'quote.approved', objectType: 'Quote', objectId: quote.id, metadata: { version: quote.version, financialHash } } });
+      return created;
+    });
+    return json(200, { approved: true, version: quote.version, approvedAt: approval.createdAt });
+  }
   const sendMatch = /^\/quotes\/([^/]+)\/send$/.exec(path);
   if (sendMatch && method === 'POST') {
     if (!['OWNER', 'ADMIN', 'SALES_MANAGER', 'SALES_REP'].includes(role)) return json(403, { error: 'Read-only role.' });
     const quote = await prisma.quote.findFirst({ where: { id: sendMatch[1], organizationId: organization.id, deletedAt: null }, include: { customer: true, items: { orderBy: { sortOrder: 'asc' } }, organization: { include: { settings: true } } } });
     if (!quote) return json(404, { error: 'Quote not found.' });
+    const requestKey = String(event.headers['idempotency-key'] || body.idempotencyKey || '').trim().slice(0, 120);
+    if (quote.status === 'SENT' && requestKey && quote.sendAttemptKey === requestKey) return json(200, { status: 'SENT', publicUrl: null, duplicate: true });
+    if (quote.status === 'SENDING' || quote.sendAttemptState === 'AMBIGUOUS') return json(409, { error: 'A send attempt is already in progress or has an uncertain provider outcome. Check delivery before retrying.' });
     if (!['DRAFT', 'INTERNAL_REVIEW'].includes(quote.status)) return json(409, { error: 'Only an editable quote can be sent.' });
     if (quote.status === 'INTERNAL_REVIEW' && !['OWNER', 'ADMIN', 'SALES_MANAGER'].includes(role)) return json(403, { error: 'A manager must approve this quote before sending.' });
+    const currentFinancialHash = financialFingerprint(quote);
+    const calculatedSendTotals = calculateQuote({ items: quote.items.map(item => ({ qty: Number(item.quantity), cost: Number(item.costSnapshot), price: Number(item.sellingPrice), tax: Number(item.taxRate) })), discount: Number(quote.discount) });
+    const settingsMargin = Number(quote.organization.settings?.minMargin ?? 20), requiresApproval = calculatedSendTotals.margin < settingsMargin || quote.items.some(item => item.minimumPriceSnapshot != null && amountScaled(item.sellingPrice) < amountScaled(item.minimumPriceSnapshot));
+    if (requiresApproval) {
+      const approval = await prisma.quoteApproval.findFirst({ where: { quoteId: quote.id, quoteVersion: quote.version, financialHash: currentFinancialHash }, orderBy: { createdAt: 'desc' } });
+      if (!approval) return json(409, { error: 'This quote requires a current manager approval before it can be sent.' });
+    }
     if (!quote.customer.email) return json(400, { error: 'The customer does not have an email address.' });
     const emailProvider = makeEmail(config);
     if (!emailProvider) return json(503, { error: 'Email delivery is not configured; the quote was not marked as sent.' });
@@ -482,24 +748,32 @@ export function createHandler(dependencies = {}) {
     const lines = quote.items.map(item => ({ catalogItemId: item.catalogItemId, name: item.nameSnapshot, sku: item.skuSnapshot, description: item.descriptionSnapshot, qty: Number(item.quantity), unit: item.unitSnapshot, price: Number(item.sellingPrice), tax: Number(item.taxRate) }));
     const totals = calculateQuote({ items: quote.items.map(item => ({ qty: Number(item.quantity), cost: Number(item.costSnapshot), price: Number(item.sellingPrice), tax: Number(item.taxRate) })), discount: Number(quote.discount) });
     const company = quote.organization.settings?.data || {};
-    const snapshot = { version: quote.version, items: lines, totals: { subtotal: totals.subtotal, tax: totals.tax, total: totals.total }, customer: { name: quote.customer.companyName, contact: quote.customer.contactName, email: quote.customer.email }, company: { name: company.company || quote.organization.name, address: company.address || '', email: company.email || '', phone: company.phone || '' }, terms: { payment: quote.paymentTerms || '', delivery: quote.deliveryTerms || '', notes: quote.customerNotes || '' } };
+    const snapshot = { version: quote.version, items: lines, totals: { subtotal: totals.gross, discount: totals.discount, netSubtotal: totals.subtotal, tax: totals.tax, total: totals.total, currency: quote.currency }, customer: { name: quote.customer.companyName, contact: quote.customer.contactName, email: quote.customer.email }, company: { name: company.company || quote.organization.name, address: company.address || '', email: company.email || '', phone: company.phone || '' }, terms: { payment: quote.paymentTerms || '', delivery: quote.deliveryTerms || '', notes: quote.customerNotes || '' } };
     const expiryAt = quote.expiryDate || new Date(Date.now() + 30 * 864e5);
+    if (expiryAt <= new Date()) return json(409, { error: 'An expired quote cannot be sent.' });
     const url = `${config.appUrl}/q/${token}`;
-    const reserved = await prisma.quote.updateMany({ where: { id: quote.id, organizationId: organization.id, status: quote.status, version: quote.version }, data: { status: 'SENDING', version: { increment: 1 } } });
+    const effectiveRequestKey = requestKey || randomBytes(16).toString('hex');
+    // Reserve the exact snapshot and token hash before giving the URL to the provider.
+    // The raw bearer token exists only in this invocation and the outbound message.
+    const reserved = await prisma.quote.updateMany({ where: { id: quote.id, organizationId: organization.id, status: quote.status, version: quote.version }, data: { status: 'SENDING', sendAttemptKey: effectiveRequestKey, sendAttemptState: 'SENDING', sendAttemptAt: new Date(), snapshot, publicTokenHash: sha256(token), publicTokenExpiresAt: expiryAt } });
     if (!reserved.count) return json(409, { error: 'The quote changed while delivery was being prepared.' });
     try { await emailProvider.send({ to: quote.customer.email, subject: `Quotation ${quote.number} — ${quote.title}`, text: `Your quotation ${quote.number} is ready. View it securely: ${url}\n\nThis link expires ${expiryAt.toISOString().slice(0, 10)}.` }); }
     catch (error) {
-      await prisma.quote.updateMany({ where: { id: quote.id, organizationId: organization.id, status: 'SENDING' }, data: { status: quote.status, version: { increment: 1 } } }).catch(() => {});
+      const ambiguous = Boolean(error?.ambiguous || error?.name === 'AbortError' || error?.code === 'ETIMEDOUT');
+      await prisma.quote.updateMany({ where: { id: quote.id, organizationId: organization.id, status: 'SENDING', sendAttemptKey: effectiveRequestKey }, data: ambiguous ? { sendAttemptState: 'AMBIGUOUS' } : { status: quote.status, sendAttemptState: 'FAILED', snapshot: quote.snapshot, publicTokenHash: null, publicTokenExpiresAt: null } }).catch(() => {});
       console.error('quote_email_failed', { organizationId: organization.id, quoteId: quote.id, message: error.message });
       return json(502, { error: 'The quote could not be emailed. It remains in its current status.' });
     }
     const changed = await prisma.$transaction(async tx => {
-      const result = await tx.quote.updateMany({ where: { id: quote.id, organizationId: organization.id, status: 'SENDING' }, data: { status: 'SENT', sentAt: new Date(), snapshot, publicTokenHash: sha256(token), publicTokenExpiresAt: expiryAt, version: { increment: 1 } } });
+      const result = await tx.quote.updateMany({ where: { id: quote.id, organizationId: organization.id, status: 'SENDING', sendAttemptKey: effectiveRequestKey }, data: { status: 'SENT', sendAttemptState: 'SENT', sentAt: new Date() } });
       if (!result.count) throw new Error('Quote state changed during delivery.');
       await tx.quoteEvent.create({ data: { quoteId: quote.id, type: 'SENT', actorUserId: user.id } });
       return result.count;
     }).catch(() => 0);
-    if (!changed) return json(409, { error: 'Email was sent, but quote state could not be finalized. Contact support before retrying.' });
+    if (!changed) {
+      await prisma.quote.updateMany({ where: { id: quote.id, organizationId: organization.id, status: 'SENDING', sendAttemptKey: effectiveRequestKey }, data: { sendAttemptState: 'AMBIGUOUS' } }).catch(() => {});
+      return json(409, { error: 'Email may have been accepted, but final state could not be confirmed. The send is blocked from retry to prevent duplicates; verify delivery.' });
+    }
     return json(200, { status: 'SENT', publicUrl: url });
   }
   const renewLinkMatch = /^\/quotes\/([^/]+)\/share-link$/.exec(path);
@@ -507,20 +781,35 @@ export function createHandler(dependencies = {}) {
     if (!['OWNER', 'ADMIN', 'SALES_MANAGER', 'SALES_REP'].includes(role)) return json(403, { error: 'Read-only role.' });
     const quote = await prisma.quote.findFirst({ where: { id: renewLinkMatch[1], organizationId: organization.id, deletedAt: null }, include: { customer: true } });
     if (!quote || !['SENT', 'VIEWED'].includes(quote.status)) return json(409, { error: 'Only a sent quote can receive a replacement customer link.' });
-    if (!quote.customer.email) return json(400, { error: 'The customer does not have an email address.' });
-    const emailProvider = makeEmail(config);
-    if (!emailProvider) return json(503, { error: 'Email delivery is not configured.' });
+    if (quote.expiryDate && quote.expiryDate <= new Date()) return json(409, { error: 'An expired quote cannot receive a new customer link.' });
     const token = randomBytes(32).toString('base64url'), publicUrl = `${config.appUrl}/q/${token}`;
     const expiryAt = quote.expiryDate || new Date(Date.now() + 30 * 864e5);
-    try { await emailProvider.send({ to: quote.customer.email, subject: `Updated secure link for quotation ${quote.number}`, text: `Open your quotation ${quote.number}: ${publicUrl}\n\nThis link expires ${expiryAt.toISOString().slice(0, 10)}. The previous link has been replaced.` }); }
-    catch (error) { console.error('quote_link_email_failed', { organizationId: organization.id, quoteId: quote.id, message: error.message }); return json(502, { error: 'A replacement link could not be emailed.' }); }
     const updated = await prisma.$transaction(async tx => {
-      const result = await tx.quote.updateMany({ where: { id: quote.id, organizationId: organization.id, status: quote.status, version: quote.version }, data: { publicTokenHash: sha256(token), publicTokenExpiresAt: expiryAt, version: { increment: 1 } } });
+      const result = await tx.quote.updateMany({ where: { id: quote.id, organizationId: organization.id, status: quote.status, version: quote.version }, data: { publicTokenHash: sha256(token), publicTokenExpiresAt: expiryAt } });
       if (!result.count) return false;
       await tx.quoteEvent.create({ data: { quoteId: quote.id, type: 'PUBLIC_LINK_REISSUED', actorUserId: user.id } });
       return true;
     });
-    return updated ? json(200, { publicUrl }) : json(409, { error: 'A concurrent quote update prevented link replacement. Check the quote before retrying.' });
+    if (!updated) return json(409, { error: 'A concurrent quote update prevented link replacement. Check the quote before retrying.' });
+    const emailProvider = makeEmail(config);
+    if (emailProvider && quote.customer.email) {
+      try { await emailProvider.send({ to: quote.customer.email, subject: `Updated secure link for quotation ${quote.number}`, text: `Open your quotation ${quote.number}: ${publicUrl}\n\nThis link expires ${expiryAt.toISOString().slice(0, 10)}. The previous link has been replaced.` }); }
+      catch (error) { console.error('quote_link_email_failed', { organizationId: organization.id, quoteId: quote.id, message: error.message }); }
+    }
+    return json(200, { publicUrl });
+  }
+  const revokeLinkMatch = /^\/quotes\/([^/]+)\/share-link$/.exec(path);
+  if (revokeLinkMatch && method === 'DELETE') {
+    if (!['OWNER', 'ADMIN', 'SALES_MANAGER'].includes(role)) return json(403, { error: 'Only managers and administrators may revoke a customer link.' });
+    const quote = await prisma.quote.findFirst({ where: { id: revokeLinkMatch[1], organizationId: organization.id, deletedAt: null }, select: { id: true, status: true, version: true, publicTokenHash: true } });
+    if (!quote || !['SENT', 'VIEWED'].includes(quote.status) || !quote.publicTokenHash) return json(404, { error: 'An active customer link was not found.' });
+    const revoked = await prisma.$transaction(async tx => {
+      const result = await tx.quote.updateMany({ where: { id: quote.id, organizationId: organization.id, status: quote.status, version: quote.version, publicTokenHash: quote.publicTokenHash }, data: { publicTokenHash: null, publicTokenExpiresAt: null } });
+      if (!result.count) return false;
+      await tx.quoteEvent.create({ data: { quoteId: quote.id, type: 'PUBLIC_LINK_REVOKED', actorUserId: user.id } });
+      return true;
+    });
+    return revoked ? json(200, { status: 'REVOKED' }) : json(409, { error: 'The quote changed while the link was being revoked.' });
   }
   if (path === '/ai/extract-rfq' && method === 'POST') {
     if (!config.ai.enabled) return json(503, { error: 'AI is disabled for this deployment.' });
@@ -609,6 +898,7 @@ const legacyEventAdapter = createHandler();
 
 /** Modern Netlify Functions request/response entry point. */
 export default async function netlifyHandler(request, context) {
+  const startedAt = Date.now(), requestId = request.headers.get('x-request-id') || randomBytes(12).toString('hex');
   const url = new URL(request.url);
   const headers = Object.fromEntries(request.headers.entries());
   if (context?.ip) headers['x-nf-client-connection-ip'] = context.ip;
@@ -621,6 +911,8 @@ export default async function netlifyHandler(request, context) {
   }
   const result = await legacyEventAdapter({ path: url.pathname, httpMethod: request.method, headers, body });
   const responseHeaders = new Headers(result.headers || {});
+  responseHeaders.set('x-request-id', requestId);
   for (const cookie of result.multiValueHeaders?.['set-cookie'] || []) responseHeaders.append('set-cookie', cookie);
-  return new Response(result.body || '', { status: result.statusCode || 200, headers: responseHeaders });
+  console.log(JSON.stringify({ level: 'info', event: 'request_completed', requestId, method: request.method, path: url.pathname, status: result.statusCode || 200, durationMs: Date.now() - startedAt }));
+  return new Response(result.isBase64Encoded ? Buffer.from(result.body || '', 'base64') : result.body || '', { status: result.statusCode || 200, headers: responseHeaders });
 }

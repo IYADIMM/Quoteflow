@@ -16,11 +16,11 @@ RFQ → review items → price → preview quote → share → customer response
 
 ## Product scope in this build
 
-The current build supports local account creation and tenant-scoped server records, a separate fictional demo, RFQ/catalog/customer/quote/follow-up workflows, server quote totals, quote snapshots and customer quote responses. CSV, browser-print PDF, deterministic local parser and follow-up drafts remain frontend helpers; they do not call a real AI, email or PDF service.
+The current build supports local account creation and tenant-scoped server records, a separate fictional browser-local demo, RFQ/catalog/customer/quote/follow-up workflows, catalog and manual quote lines in one currency, server quote totals and minimum-price checks, explicit approval records, editable drafts, immutable sent revisions, send-time customer snapshots, public-link rotation/revocation/expiry, and customer accept/reject/question responses. Customer questions are stored as quote events before seller notification is attempted. The seller experience includes an attention dashboard, per-currency summaries, live margin visibility, global search, clear next actions, responsive quote building, customer-safe server PDFs, optional private RFQ attachments, plan usage and Stripe-hosted billing. CSV, deterministic local parser and demo follow-up drafts remain frontend helpers.
 
 ## Commercial model hypothesis
 
-Initial positioning may be tested around Free, Pro at $39/month and Business at $99/month. These are unvalidated hypotheses, not market research or live subscriptions. A hosted version needs server-enforced limits and a real billing provider before charging.
+Free, Pro and Business are implemented as configurable entitlement labels backed by Stripe Price IDs. No monetary amount is hard-coded. Pricing and packaging remain unvalidated hypotheses until customer interviews and paid pilots establish willingness to pay.
 
 ## Success measures to collect after a privacy-reviewed launch
 

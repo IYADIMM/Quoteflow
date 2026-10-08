@@ -1,23 +1,22 @@
 # Roadmap
 
-## Completed in this demo
+## Completed in the release candidate
 
 - Responsive QuoteFlow workspace and account-free demo entry.
 - Fictional dashboard, customers, catalog, RFQs, quotes and follow-ups.
 - Local RFQ item suggestions, review-before-use, quote builder and margin calculations.
-- Printed quotation, customer response page, acceptance/decline and local audit events.
+- Immutable customer snapshots, server PDFs, customer response page, acceptance/decline/questions and commercial audit events.
 - Basic search, CSV import/export, settings and product documentation.
+- Tenant authentication/roles, billing/entitlements, private object-storage path, provider adapters, release tests and operations/acquisition handover.
 
 ## Near term
 
-1. Validate terminology, quote quality and customer willingness to pay with target businesses.
-2. Build a real server-side application and PostgreSQL schema with tenant-scoped authorization.
-3. Add durable authentication, account recovery, organization onboarding and role enforcement.
-4. Generate multi-page PDFs server-side and make quote snapshots immutable after sending.
-5. Add email-provider adapter, verified sending domain and quote delivery history.
-6. Add integration tests for pricing edge cases, public token lifecycle and cross-tenant access.
-7. Add export, deletion, backup/restore, observability and support workflows.
-8. Validate plan packaging and implement real checkout/webhooks only after demand is demonstrated.
+1. Complete live staging qualification for PostgreSQL, Netlify, Stripe, Resend, Gemini, storage and Upstash.
+2. Execute and record the first isolated backup restoration drill.
+3. Add malware scanning/quarantine before accepting untrusted external uploads at scale.
+4. Finish ownership transfer, email change, account deletion execution and settings UI for team/security APIs.
+5. Add cursor pagination/virtualized search before targeting very large tenants.
+6. Validate terminology, quote quality, plan packaging and willingness to pay with target businesses.
 
 ## Future opportunities
 
