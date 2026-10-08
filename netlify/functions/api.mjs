@@ -138,36 +138,63 @@ export function createHandler(dependencies = {}) {
 
   if (path === '/stripe/webhook' && method === 'POST') {
     if (!config.stripe.enabled) return json(404, { error: 'Billing webhook is disabled.' });
+    const billing = makeBilling(config);
     let stripeEvent;
-    try { stripeEvent = await makeBilling(config).constructEvent(event.body || '', event.headers['stripe-signature'] || event.headers['Stripe-Signature'] || ''); }
+    try { stripeEvent = await billing.constructEvent(event.body || '', event.headers['stripe-signature'] || event.headers['Stripe-Signature'] || ''); }
     catch (error) { console.error('stripe_webhook_rejected', { message: error.message }); return json(400, { error: 'Stripe signature verification failed.' }); }
     const object = stripeEvent.data?.object || {}, eventHash = stripePayloadHash(event.body || '');
     const metadataOrganizationId = object.metadata?.quoteflowOrganizationId || object.client_reference_id || object.subscription_details?.metadata?.quoteflowOrganizationId || null;
+    const isSubscriptionEvent = stripeEvent.type.startsWith('customer.subscription.');
+    const isInvoiceEvent = ['invoice.payment_failed', 'invoice.paid', 'invoice.payment_succeeded', 'payment_intent.payment_failed'].includes(stripeEvent.type);
+    const subscriptionId = isSubscriptionEvent ? object.id
+      : stripeEvent.type === 'checkout.session.completed' ? (typeof object.subscription === 'string' ? object.subscription : object.subscription?.id)
+      : isInvoiceEvent ? (typeof object.subscription === 'string' ? object.subscription : object.parent?.subscription_details?.subscription || null)
+      : null;
+    // Stripe webhook payloads are historical snapshots. Always reconcile the
+    // CURRENT subscription rather than letting late invoice/subscription events
+    // overwrite newer paid, canceled or past-due state.
+    let currentSubscription = null;
+    if (subscriptionId && (isSubscriptionEvent || isInvoiceEvent || stripeEvent.type === 'checkout.session.completed')) {
+      try { currentSubscription = await billing.retrieveSubscription(subscriptionId); }
+      catch (error) { console.error('stripe_subscription_reconcile_failed', { eventId: stripeEvent.id, message: error.message }); return json(503, { error: 'Billing state could not be reconciled. Stripe may retry.' }); }
+    }
+    const eventAt = Number.isInteger(stripeEvent.created) && stripeEvent.created > 0 ? new Date(stripeEvent.created * 1000) : null;
     try {
       await prisma.$transaction(async tx => {
         await tx.stripeEvent.create({ data: { id: stripeEvent.id, organizationId: metadataOrganizationId, type: stripeEvent.type, livemode: Boolean(stripeEvent.livemode), payloadHash: eventHash } });
-        if (stripeEvent.type === 'checkout.session.completed' && metadataOrganizationId) {
-          await tx.subscription.upsert({ where: { organizationId: metadataOrganizationId }, create: { organizationId: metadataOrganizationId, plan: String(object.metadata?.plan || 'FREE').toUpperCase(), status: 'INCOMPLETE', stripeCustomerId: typeof object.customer === 'string' ? object.customer : object.customer?.id || null, stripeSubscriptionId: typeof object.subscription === 'string' ? object.subscription : object.subscription?.id || null, lastStripeSyncAt: new Date() }, update: { stripeCustomerId: typeof object.customer === 'string' ? object.customer : object.customer?.id || undefined, stripeSubscriptionId: typeof object.subscription === 'string' ? object.subscription : object.subscription?.id || undefined, lastStripeSyncAt: new Date() } });
-        }
-        if (stripeEvent.type.startsWith('customer.subscription.')) {
-          let organizationId = metadataOrganizationId;
-          if (!organizationId) organizationId = (await tx.subscription.findFirst({ where: { OR: [{ stripeSubscriptionId: object.id }, { stripeCustomerId: typeof object.customer === 'string' ? object.customer : object.customer?.id }] }, select: { organizationId: true } }))?.organizationId;
+        if (currentSubscription) {
+          let organizationId = currentSubscription.metadata?.quoteflowOrganizationId || metadataOrganizationId;
+          const customerId = typeof currentSubscription.customer === 'string' ? currentSubscription.customer : currentSubscription.customer?.id;
+          if (!organizationId) organizationId = (await tx.subscription.findFirst({ where: { OR: [{ stripeSubscriptionId: currentSubscription.id }, { stripeCustomerId: customerId }] }, select: { organizationId: true } }))?.organizationId;
           if (!organizationId) throw new Error('Stripe subscription is not linked to a QuoteFlow organization.');
-          await tx.subscription.upsert({ where: { organizationId }, create: { organizationId, ...subscriptionRecord(object, config.stripe.prices) }, update: subscriptionRecord(object, config.stripe.prices) });
-          await tx.auditLog.create({ data: { organizationId, action: `billing.${stripeEvent.type}`, objectType: 'Subscription', objectId: object.id, metadata: { status: object.status, priceId: object.items?.data?.[0]?.price?.id || null } } });
+          const stored = await tx.subscription.findUnique({ where: { organizationId } });
+          if (eventAt && stored?.lastStripeEventAt && stored.lastStripeEventAt > eventAt) return;
+          const next = { ...subscriptionRecord(currentSubscription, config.stripe.prices), ...(eventAt ? { lastStripeEventAt: eventAt } : {}) };
+          if (stored) {
+            const updated = await tx.subscription.updateMany({
+              where: { organizationId, ...(eventAt ? { OR: [{ lastStripeEventAt: null }, { lastStripeEventAt: { lte: eventAt } }] } : {}) },
+              data: next
+            });
+            if (!updated.count) return;
+          } else {
+            await tx.subscription.create({ data: { organizationId, ...next } });
+          }
+          await tx.auditLog.create({ data: { organizationId, action: `billing.${stripeEvent.type}`, objectType: 'Subscription', objectId: currentSubscription.id, metadata: { status: currentSubscription.status, priceId: currentSubscription.items?.data?.[0]?.price?.id || null } } });
+        } else if (stripeEvent.type === 'checkout.session.completed' && metadataOrganizationId) {
+          // Preserve an existing paid state; Checkout never grants entitlements
+          // until Stripe's actual subscription status has been reconciled.
+          await tx.subscription.upsert({
+            where: { organizationId: metadataOrganizationId },
+            create: { organizationId: metadataOrganizationId, plan: 'FREE', status: 'INCOMPLETE', stripeCustomerId: typeof object.customer === 'string' ? object.customer : object.customer?.id || null, stripeSubscriptionId: typeof object.subscription === 'string' ? object.subscription : object.subscription?.id || null },
+            update: { stripeCustomerId: typeof object.customer === 'string' ? object.customer : object.customer?.id || undefined }
+          });
         }
-        if (['invoice.payment_failed', 'payment_intent.payment_failed'].includes(stripeEvent.type)) {
-          const customerId = typeof object.customer === 'string' ? object.customer : object.customer?.id;
-          const subscription = customerId ? await tx.subscription.findFirst({ where: { stripeCustomerId: customerId } }) : null;
-          if (subscription) { await tx.subscription.update({ where: { organizationId: subscription.organizationId }, data: { status: 'PAST_DUE', lastStripeSyncAt: new Date() } }); await tx.auditLog.create({ data: { organizationId: subscription.organizationId, action: 'billing.payment_failed', objectType: 'Subscription', objectId: subscription.id } }); }
-        }
-        if (['invoice.paid', 'invoice.payment_succeeded'].includes(stripeEvent.type)) {
-          const customerId = typeof object.customer === 'string' ? object.customer : object.customer?.id;
-          const subscription = customerId ? await tx.subscription.findFirst({ where: { stripeCustomerId: customerId } }) : null;
-          if (subscription && subscription.status === 'PAST_DUE') await tx.subscription.update({ where: { organizationId: subscription.organizationId }, data: { status: 'ACTIVE', lastStripeSyncAt: new Date() } });
-        }
-      });
-    } catch (error) { if (error.code === 'P2002') return json(200, { received: true, duplicate: true }); console.error('stripe_webhook_processing_failed', { eventId: stripeEvent.id, type: stripeEvent.type, message: error.message }); return json(500, { error: 'Webhook processing failed and may be retried.' }); }
+      }, { isolationLevel: 'Serializable' });
+    } catch (error) {
+      if (error.code === 'P2002') return json(200, { received: true, duplicate: true });
+      console.error('stripe_webhook_processing_failed', { eventId: stripeEvent.id, type: stripeEvent.type, message: error.message });
+      return json(500, { error: 'Webhook processing failed and may be retried.' });
+    }
     return json(200, { received: true });
   }
 
