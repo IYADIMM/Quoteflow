@@ -13,7 +13,7 @@ The source release gate passes and the application has credible server-side cont
 
 | Area | Result | Evidence | Remaining gate |
 |---|---|---|---|
-| Repository and CI | PASS | Branch preserved; GitHub PR #2 `validate` check passed at `8265f55`. | Push final audit fixes and require CI on the resulting commit. |
+| Repository and CI | PASS | Branch preserved; GitHub PR #2 `validate` passed after the final implementation and audit push. | Require the same gate before any approved production deployment. |
 | Install and source gate | PASS | Frozen pnpm install, Prisma validation/generation, 66 tests, build, and release gate pass. | None at source level. |
 | PostgreSQL runtime | FAIL | Local migration target at `localhost:5432` is unavailable; Netlify health returns 503. | Connect isolated managed staging PostgreSQL, migrate, qualify, and retest. |
 | Database qualification | BLOCKED | `STAGING_DATABASE_URL` is absent; the guard correctly refused to run. | Supply an isolated staging URL whose database name passes the safety guard. |

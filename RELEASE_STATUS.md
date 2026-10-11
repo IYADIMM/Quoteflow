@@ -2,7 +2,7 @@
 
 ## STAGING_READY — pending live qualification
 
-The source previously passed local clean-install checks and GitHub pull-request CI. On 11 October 2026, the current release-candidate workspace passed Prisma validation and generation, all 66 automated tests, the static build, and a production dependency advisory check. GitHub PR #2 passed at commit `8265f55`; the final audit fixes require a new CI run after push. The revised signup and business onboarding flow has not received a current browser automation run; prior demo-oriented browser evidence is historical and does not qualify this branch.
+On 11 October 2026, the current release-candidate workspace passed Prisma validation and generation, all 66 automated tests, the static build, and a production dependency advisory check. GitHub PR #2 also passed its `validate` check after the final implementation and audit push. The revised signup and business onboarding flow has not received a current browser automation run; prior demo-oriented browser evidence is historical and does not qualify this branch.
 
 Source corrections include discount reconciliation, margin policy consistency, customer maintenance, canonical PDF archival, Stripe webhook reconciliation and ordering, strict past-due grace handling, sanitized customer-link logs and serializable quote/team/storage quota reservations.
 

@@ -11,7 +11,7 @@
 - 66 automated tests with zero failures.
 - Static build and source release controls.
 - Production dependency audit with no known vulnerabilities.
-- GitHub PR #2 CI passed on the pre-final-fix commit.
+- GitHub PR #2 CI passed after the final implementation and audit push.
 - Core source paths for authentication, tenancy, pricing, approval, revision, PDF, public responses, providers, rate limiting, and security controls.
 
 ## Failed
