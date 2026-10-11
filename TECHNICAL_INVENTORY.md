@@ -6,7 +6,7 @@
 - One Netlify Function API in `netlify/functions/api.mjs`.
 - PostgreSQL through Prisma 7 and `@prisma/adapter-pg`; migrations in `prisma/migrations`.
 - Fixed-point commercial engine, catalog/manual normalization, Gemini, Resend, Stripe, PDFKit, S3 and Upstash adapters under `lib/`.
-- Browser-local fictional demo isolated from authenticated account records.
+- Account-only onboarding with server-authoritative organization records.
 
 ## Complete in code and automated tests
 

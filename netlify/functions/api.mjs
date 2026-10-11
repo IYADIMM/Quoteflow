@@ -4,7 +4,7 @@ import { readConfig } from '../../lib/config.mjs';
 import { getPrisma } from '../../lib/prisma.mjs';
 import { GeminiProvider } from '../../lib/ai-provider.mjs';
 import { createEmailProvider } from '../../lib/email-provider.mjs';
-import { calculateQuote } from '../../lib/pricing.mjs';
+import { calculateQuote, decimal4 } from '../../lib/pricing.mjs';
 import { evaluateQuotePolicy } from '../../lib/commercial-policy.mjs';
 import { amountScaled, normalizeQuoteLines, quoteItemData, validCurrency } from '../../lib/quote-lines.mjs';
 import { StripeBillingProvider, stripePayloadHash, subscriptionRecord } from '../../lib/billing-provider.mjs';
@@ -13,6 +13,7 @@ import { S3StorageProvider, storageKey, validateUpload } from '../../lib/storage
 import { generateQuotePdf } from '../../lib/pdf-provider.mjs';
 import { createRateLimiter } from '../../lib/rate-limit.mjs';
 import { createMonitor } from '../../lib/monitoring.mjs';
+import { marketForCountry, validMarketCurrency } from '../../lib/markets.mjs';
 
 export const config = { path: '/api/*' };
 const scrypt = promisify(scryptCallback);
@@ -39,7 +40,8 @@ async function passwordMatches(user, password) {
 }
 const ai = config => new GeminiProvider({ apiKey: config.ai.apiKey, model: config.ai.model });
 const titleStatus = value => ({ DRAFT: 'Draft', INTERNAL_REVIEW: 'Internal Review', SENDING: 'Sending', SENT: 'Sent', VIEWED: 'Viewed', ACCEPTED: 'Accepted', REJECTED: 'Rejected', EXPIRED: 'Expired', NEW: 'New', REVIEWING: 'Reviewing', PRICING: 'Pricing', QUOTED: 'Quoted', WON: 'Won', LOST: 'Lost', CANCELLED: 'Cancelled', PENDING: 'Pending', COMPLETED: 'Completed', SNOOZED: 'Snoozed' })[value] || value;
-const quoteDTO = quote => ({ ...quote, created: quote.issueDate?.toISOString().slice(0, 10), expiry: quote.expiryDate?.toISOString().slice(0, 10) || '', payment: quote.paymentTerms, delivery: quote.deliveryTerms, notes: quote.customerNotes, status: titleStatus(quote.status), discount: Number(quote.discount), items: (quote.items || []).map(line => ({ id: line.id, catalogItemId: line.catalogItemId, lineType: line.catalogItemId ? 'CATALOG' : 'MANUAL', name: line.nameSnapshot, sku: line.skuSnapshot, description: line.descriptionSnapshot, qty: Number(line.quantity), unit: line.unitSnapshot, cost: Number(line.costSnapshot), price: Number(line.sellingPrice), minimumPrice: line.minimumPriceSnapshot == null ? null : Number(line.minimumPriceSnapshot), tax: Number(line.taxRate) })) });
+export const isQuoteExpired = (quote, now = new Date()) => Boolean(quote?.expiryDate && quote.expiryDate < now && !['ACCEPTED', 'REJECTED'].includes(quote.status));
+const quoteDTO = quote => ({ ...quote, created: quote.issueDate?.toISOString().slice(0, 10), expiry: quote.expiryDate?.toISOString().slice(0, 10) || '', expired: isQuoteExpired(quote), payment: quote.paymentTerms, delivery: quote.deliveryTerms, notes: quote.customerNotes, status: titleStatus(quote.status), discount: Number(quote.discount), items: (quote.items || []).map(line => ({ id: line.id, catalogItemId: line.catalogItemId, lineType: line.catalogItemId ? 'CATALOG' : 'MANUAL', name: line.nameSnapshot, sku: line.skuSnapshot, description: line.descriptionSnapshot, qty: Number(line.quantity), unit: line.unitSnapshot, cost: Number(line.costSnapshot), price: Number(line.sellingPrice), minimumPrice: line.minimumPriceSnapshot == null ? null : Number(line.minimumPriceSnapshot), tax: Number(line.taxRate) })) });
 
 async function authenticate(event, prisma) {
   const rawCookie = event.headers.cookie || event.headers.Cookie || '';
@@ -210,7 +212,17 @@ export function createHandler(dependencies = {}) {
     const email = String(body.email || '').trim().toLowerCase(), password = body.password, organizationName = String(body.organization || '').trim();
     const limited = await throttle('auth-signup', requestIp, 5, 3600); if (limited) return limited;
     const inviteToken = String(body.invitationToken || '').slice(0, 200);
+    const market = inviteToken ? null : marketForCountry(body.country);
+    const currency = String(body.currency || market?.currency || '').trim().toUpperCase();
+    const businessPhone = String(body.phone || '').trim().slice(0, 80);
+    const businessAddress = String(body.address || '').trim().slice(0, 500);
+    const paymentTerms = String(body.payment || '').trim().slice(0, 500);
+    const taxRate = Number(body.tax ?? market?.taxRate ?? 0);
+    const minMargin = Number(body.margin ?? 20);
+    const quoteValidityDays = Number(body.validity ?? 30);
     if (!/^\S+@\S+\.\S+$/.test(email) || typeof password !== 'string' || password.length < 12 || password.length > 256 || (!inviteToken && (organizationName.length < 2 || organizationName.length > 120))) return json(400, { error: 'Enter a valid email, a 12-character password and an organization name.' });
+    if (!inviteToken && (!market || !validMarketCurrency(currency))) return json(400, { error: 'Choose a supported country and currency.' });
+    if (!inviteToken && (!Number.isFinite(taxRate) || taxRate < 0 || taxRate > 100 || !Number.isFinite(minMargin) || minMargin < 0 || minMargin > 100 || !Number.isInteger(quoteValidityDays) || quoteValidityDays < 1 || quoteValidityDays > 365)) return json(400, { error: 'Enter valid tax, margin and quote-validity defaults.' });
     const invitation = inviteToken ? await prisma.invitation.findUnique({ where: { tokenHash: sha256(inviteToken) }, include: { organization: true } }) : null;
     if (inviteToken && (!invitation || invitation.acceptedAt || invitation.expiresAt <= new Date())) return json(400, { error: 'Invitation is invalid, expired or already accepted.' });
     if (invitation && invitation.email !== email) return json(403, { error: 'Use the email address that received this invitation.' });
@@ -228,7 +240,7 @@ export function createHandler(dependencies = {}) {
           if (!await teamHasCapacity(tx, organization.id)) throw new Error('TEAM_LIMIT');
           await tx.membership.create({ data: { userId: user.id, organizationId: organization.id, role: memberRole } });
         } else {
-          organization = await tx.organization.create({ data: { name: organizationName, settings: { create: { data: { company: organizationName, currency: 'AED', tax: 5, margin: 20, validity: 30 } } }, subscription: { create: { plan: 'FREE', status: 'ACTIVE' } } } });
+          organization = await tx.organization.create({ data: { name: organizationName, reportingCurrency: currency, settings: { create: { data: { company: organizationName, country: market.country, currency, email, phone: businessPhone, address: businessAddress, tax: taxRate, margin: minMargin, validity: quoteValidityDays, payment: paymentTerms, delivery: '', template: 'Modern' }, minMargin: minMargin.toFixed(4), quoteValidityDays } }, subscription: { create: { plan: 'FREE', status: 'ACTIVE' } } } });
           await tx.membership.create({ data: { userId: user.id, organizationId: organization.id, role: memberRole } });
         }
         await tx.session.create({ data: { tokenHash: sha256(sessionToken), userId: user.id, organizationId: organization.id, expiresAt: new Date(Date.now() + 30 * 864e5) } });
@@ -579,8 +591,7 @@ export function createHandler(dependencies = {}) {
       prisma.followUp.findMany({ where: { organizationId: organization.id, deletedAt: null }, orderBy: { dueAt: 'asc' } }),
       prisma.quoteEvent.findMany({ where: { quote: { organizationId: organization.id, deletedAt: null } }, include: { quote: { select: { id: true, number: true } } }, orderBy: { createdAt: 'desc' }, take: 500 })
     ]);
-    const statusLabel = value => ({ DRAFT: 'Draft', INTERNAL_REVIEW: 'Internal Review', SENDING: 'Sending', SENT: 'Sent', VIEWED: 'Viewed', ACCEPTED: 'Accepted', REJECTED: 'Rejected', EXPIRED: 'Expired', NEW: 'New', REVIEWING: 'Reviewing', PRICING: 'Pricing', QUOTED: 'Quoted', WON: 'Won', LOST: 'Lost', CANCELLED: 'Cancelled', PENDING: 'Pending', COMPLETED: 'Completed', SNOOZED: 'Snoozed' })[value] || value;
-    return json(200, { user: { id: user.id, email: user.email, role }, organization: { id: organization.id, name: organization.name, currency: organization.reportingCurrency }, settings: settings?.data || {}, customers: customers.map(item => ({ ...item, name: item.companyName, contact: item.contactName })), products: catalogItems.map(item => ({ ...item, price: Number(item.sellingPrice), cost: Number(item.cost), tax: Number(item.taxRate) })), rfqs: rfqs.map(item => ({ ...item, received: item.receivedAt.toISOString().slice(0, 10), deadline: item.deadline?.toISOString().slice(0, 10) || '', status: statusLabel(item.status), items: item.items.map(line => ({ catalogItemId: line.catalogItemId, name: line.description, description: line.notes || '', qty: Number(line.quantity), unit: line.unit, sourceText: line.sourceText, confidence: Number(line.confidence) || 0 })) })), quotes: quotes.map(item => ({ ...item, created: item.issueDate.toISOString().slice(0, 10), expiry: item.expiryDate?.toISOString().slice(0, 10) || '', payment: item.paymentTerms, delivery: item.deliveryTerms, notes: item.customerNotes, status: statusLabel(item.status), discount: Number(item.discount), items: item.items.map(line => ({ catalogItemId: line.catalogItemId, lineType: line.catalogItemId ? 'CATALOG' : 'MANUAL', name: line.nameSnapshot, sku: line.skuSnapshot, description: line.descriptionSnapshot, qty: Number(line.quantity), unit: line.unitSnapshot, cost: Number(line.costSnapshot), price: Number(line.sellingPrice), minimumPrice: line.minimumPriceSnapshot == null ? null : Number(line.minimumPriceSnapshot), tax: Number(line.taxRate) })) })), followups: followUps.map(item => ({ ...item, title: item.task, due: item.dueAt.toISOString().slice(0, 10), note: item.notes, status: statusLabel(item.status) })), events: events.map(event => ({ ...event, number: event.quote.number })) });
+    return json(200, { user: { id: user.id, email: user.email, role }, organization: { id: organization.id, name: organization.name, currency: organization.reportingCurrency }, settings: settings?.data || {}, customers: customers.map(item => ({ ...item, name: item.companyName, contact: item.contactName })), products: catalogItems.map(item => ({ ...item, price: Number(item.sellingPrice), cost: Number(item.cost), tax: Number(item.taxRate) })), rfqs: rfqs.map(item => ({ ...item, received: item.receivedAt.toISOString().slice(0, 10), deadline: item.deadline?.toISOString().slice(0, 10) || '', status: titleStatus(item.status), items: item.items.map(line => ({ catalogItemId: line.catalogItemId, name: line.description, description: line.notes || '', qty: Number(line.quantity), unit: line.unit, sourceText: line.sourceText, confidence: Number(line.confidence) || 0 })) })), quotes: quotes.map(quoteDTO), followups: followUps.map(item => ({ ...item, title: item.task, due: item.dueAt.toISOString().slice(0, 10), note: item.notes, status: titleStatus(item.status) })), events: events.map(event => ({ ...event, number: event.quote.number })) });
   }
   if (path === '/customers' && method === 'GET') return json(200, { items: await prisma.customer.findMany({ where: { organizationId: organization.id, deletedAt: null }, orderBy: { createdAt: 'desc' } }) });
   if (path === '/customers' && method === 'POST') {
@@ -651,7 +662,7 @@ export function createHandler(dependencies = {}) {
     }
     const minimumPrice = minimumInput == null ? null : Number(minimumInput);
     if (minimumPrice != null && amountScaled(priceInput) < amountScaled(minimumInput)) return json(400, { error: 'Selling price cannot be below the minimum price.' });
-    const data = { name, sku: String(body.sku || '').slice(0, 80) || null, description: String(body.description || '').slice(0, 2000) || null, category: String(body.category || '').slice(0, 100) || null, unit: String(body.unit || 'each').slice(0, 40), cost: cost.toFixed(4), sellingPrice: price.toFixed(4), minimumPrice: minimumPrice?.toFixed(4) ?? null, taxRate: tax.toFixed(4), currency, active: body.active !== false };
+    const data = { name, sku: String(body.sku || '').slice(0, 80) || null, description: String(body.description || '').slice(0, 2000) || null, category: String(body.category || '').slice(0, 100) || null, unit: String(body.unit || 'each').slice(0, 40), cost: decimal4(costInput, 'Cost'), sellingPrice: decimal4(priceInput, 'Price'), minimumPrice: minimumInput == null ? null : decimal4(minimumInput, 'Minimum price'), taxRate: decimal4(taxInput, 'Tax rate'), currency, active: body.active !== false };
     let item;
     if (body.id) {
       const current = await prisma.catalogItem.findFirst({ where: { id: String(body.id), organizationId: organization.id, deletedAt: null } });
@@ -711,8 +722,11 @@ export function createHandler(dependencies = {}) {
     const validity = Number(body.validity ?? 30);
     if (!Number.isInteger(validity) || validity < 1 || validity > 365) return json(400, { error: 'Quote validity must be between 1 and 365 days.' });
     const quoteValidityDays = validity;
-    const settings = await prisma.companySettings.upsert({ where: { organizationId: organization.id }, create: { organizationId: organization.id, data: { ...body, company, margin: minMargin, marginMode, validity: quoteValidityDays }, marginMode, minMargin: minMargin.toFixed(4), quoteValidityDays }, update: { data: { ...body, company, margin: minMargin, marginMode, validity: quoteValidityDays }, marginMode, minMargin: minMargin.toFixed(4), quoteValidityDays } });
-    if (body.currency) await prisma.organization.update({ where: { id: organization.id }, data: { reportingCurrency: String(body.currency).slice(0, 3).toUpperCase() } });
+    const market = marketForCountry(body.country || 'AE');
+    const currency = String(body.currency || organization.reportingCurrency).trim().toUpperCase();
+    if (!market || !validMarketCurrency(currency)) return json(400, { error: 'Choose a supported country and currency.' });
+    const settings = await prisma.companySettings.upsert({ where: { organizationId: organization.id }, create: { organizationId: organization.id, data: { ...body, country: market.country, currency, company, margin: minMargin, marginMode, validity: quoteValidityDays }, marginMode, minMargin: minMargin.toFixed(4), quoteValidityDays }, update: { data: { ...body, country: market.country, currency, company, margin: minMargin, marginMode, validity: quoteValidityDays }, marginMode, minMargin: minMargin.toFixed(4), quoteValidityDays } });
+    await prisma.organization.update({ where: { id: organization.id }, data: { reportingCurrency: currency } });
     return json(200, { settings: settings.data });
   }
   if (path === '/analytics' && method === 'GET') {

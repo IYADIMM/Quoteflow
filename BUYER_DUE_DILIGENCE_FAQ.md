@@ -10,7 +10,7 @@ The value is the integrated RFQ-to-response workflow: fixed-point pricing, catal
 
 ## What passed?
 
-On 2026-10-08: a clean source-only dependency install, Prisma validation/generation, static build, 50 automated tests and 52 browser checks. Provider tests are mocks.
+On 2026-10-11: the frozen dependency install, Prisma validation/generation, static build, release gate, 66 automated tests, and production dependency advisory check passed. Current onboarding browser E2E is not verified. Provider tests are mocks unless `PROVIDER_INTEGRATION_STATUS.md` explicitly records a live result.
 
 ## What remains unverified?
 
