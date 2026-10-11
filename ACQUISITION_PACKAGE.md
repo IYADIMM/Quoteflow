@@ -2,7 +2,7 @@
 
 ## Asset
 
-QuoteFlow is a focused B2B RFQ-to-quotation SaaS asset: seller workspace, commercial pricing engine, approval/revision controls, customer portal, server-generated documents, tenant/auth model, billing and provider integrations, automated tests, fictional demo and operator documentation.
+QuoteFlow is a focused B2B RFQ-to-quotation SaaS asset: seller workspace, commercial pricing engine, approval/revision controls, customer portal, server-generated documents, tenant/auth model, billing and provider integrations, automated tests, onboarding flow and operator documentation.
 
 The asset should be valued against the time and risk to reproduce its workflow, commercial rules and release infrastructure. This repository does not evidence market traction, revenue, customers, retention or intellectual-property clearance beyond the seller’s representations.
 

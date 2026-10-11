@@ -13,6 +13,7 @@ import { S3StorageProvider, storageKey, validateUpload } from '../../lib/storage
 import { generateQuotePdf } from '../../lib/pdf-provider.mjs';
 import { createRateLimiter } from '../../lib/rate-limit.mjs';
 import { createMonitor } from '../../lib/monitoring.mjs';
+import { marketForCountry, validMarketCurrency } from '../../lib/markets.mjs';
 
 export const config = { path: '/api/*' };
 const scrypt = promisify(scryptCallback);
@@ -210,7 +211,17 @@ export function createHandler(dependencies = {}) {
     const email = String(body.email || '').trim().toLowerCase(), password = body.password, organizationName = String(body.organization || '').trim();
     const limited = await throttle('auth-signup', requestIp, 5, 3600); if (limited) return limited;
     const inviteToken = String(body.invitationToken || '').slice(0, 200);
+    const market = inviteToken ? null : marketForCountry(body.country);
+    const currency = String(body.currency || market?.currency || '').trim().toUpperCase();
+    const businessPhone = String(body.phone || '').trim().slice(0, 80);
+    const businessAddress = String(body.address || '').trim().slice(0, 500);
+    const paymentTerms = String(body.payment || '').trim().slice(0, 500);
+    const taxRate = Number(body.tax ?? market?.taxRate ?? 0);
+    const minMargin = Number(body.margin ?? 20);
+    const quoteValidityDays = Number(body.validity ?? 30);
     if (!/^\S+@\S+\.\S+$/.test(email) || typeof password !== 'string' || password.length < 12 || password.length > 256 || (!inviteToken && (organizationName.length < 2 || organizationName.length > 120))) return json(400, { error: 'Enter a valid email, a 12-character password and an organization name.' });
+    if (!inviteToken && (!market || !validMarketCurrency(currency))) return json(400, { error: 'Choose a supported country and currency.' });
+    if (!inviteToken && (!Number.isFinite(taxRate) || taxRate < 0 || taxRate > 100 || !Number.isFinite(minMargin) || minMargin < 0 || minMargin > 100 || !Number.isInteger(quoteValidityDays) || quoteValidityDays < 1 || quoteValidityDays > 365)) return json(400, { error: 'Enter valid tax, margin and quote-validity defaults.' });
     const invitation = inviteToken ? await prisma.invitation.findUnique({ where: { tokenHash: sha256(inviteToken) }, include: { organization: true } }) : null;
     if (inviteToken && (!invitation || invitation.acceptedAt || invitation.expiresAt <= new Date())) return json(400, { error: 'Invitation is invalid, expired or already accepted.' });
     if (invitation && invitation.email !== email) return json(403, { error: 'Use the email address that received this invitation.' });
@@ -228,7 +239,7 @@ export function createHandler(dependencies = {}) {
           if (!await teamHasCapacity(tx, organization.id)) throw new Error('TEAM_LIMIT');
           await tx.membership.create({ data: { userId: user.id, organizationId: organization.id, role: memberRole } });
         } else {
-          organization = await tx.organization.create({ data: { name: organizationName, settings: { create: { data: { company: organizationName, currency: 'AED', tax: 5, margin: 20, validity: 30 } } }, subscription: { create: { plan: 'FREE', status: 'ACTIVE' } } } });
+          organization = await tx.organization.create({ data: { name: organizationName, reportingCurrency: currency, settings: { create: { data: { company: organizationName, country: market.country, currency, email, phone: businessPhone, address: businessAddress, tax: taxRate, margin: minMargin, validity: quoteValidityDays, payment: paymentTerms, delivery: '', template: 'Modern' }, minMargin: minMargin.toFixed(4), quoteValidityDays } }, subscription: { create: { plan: 'FREE', status: 'ACTIVE' } } } });
           await tx.membership.create({ data: { userId: user.id, organizationId: organization.id, role: memberRole } });
         }
         await tx.session.create({ data: { tokenHash: sha256(sessionToken), userId: user.id, organizationId: organization.id, expiresAt: new Date(Date.now() + 30 * 864e5) } });
@@ -711,8 +722,11 @@ export function createHandler(dependencies = {}) {
     const validity = Number(body.validity ?? 30);
     if (!Number.isInteger(validity) || validity < 1 || validity > 365) return json(400, { error: 'Quote validity must be between 1 and 365 days.' });
     const quoteValidityDays = validity;
-    const settings = await prisma.companySettings.upsert({ where: { organizationId: organization.id }, create: { organizationId: organization.id, data: { ...body, company, margin: minMargin, marginMode, validity: quoteValidityDays }, marginMode, minMargin: minMargin.toFixed(4), quoteValidityDays }, update: { data: { ...body, company, margin: minMargin, marginMode, validity: quoteValidityDays }, marginMode, minMargin: minMargin.toFixed(4), quoteValidityDays } });
-    if (body.currency) await prisma.organization.update({ where: { id: organization.id }, data: { reportingCurrency: String(body.currency).slice(0, 3).toUpperCase() } });
+    const market = marketForCountry(body.country || 'AE');
+    const currency = String(body.currency || organization.reportingCurrency).trim().toUpperCase();
+    if (!market || !validMarketCurrency(currency)) return json(400, { error: 'Choose a supported country and currency.' });
+    const settings = await prisma.companySettings.upsert({ where: { organizationId: organization.id }, create: { organizationId: organization.id, data: { ...body, country: market.country, currency, company, margin: minMargin, marginMode, validity: quoteValidityDays }, marginMode, minMargin: minMargin.toFixed(4), quoteValidityDays }, update: { data: { ...body, country: market.country, currency, company, margin: minMargin, marginMode, validity: quoteValidityDays }, marginMode, minMargin: minMargin.toFixed(4), quoteValidityDays } });
+    await prisma.organization.update({ where: { id: organization.id }, data: { reportingCurrency: currency } });
     return json(200, { settings: settings.data });
   }
   if (path === '/analytics' && method === 'GET') {

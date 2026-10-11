@@ -1,6 +1,6 @@
 # QuoteFlow
 
-QuoteFlow is a B2B request-for-quotation and quote workflow with a browser demo and a server-backed account mode. The account API runs as a Netlify Function and persists tenant data in PostgreSQL through Prisma.
+QuoteFlow is a B2B request-for-quotation and quote workflow backed by a Netlify Function and PostgreSQL through Prisma.
 
 ## Local setup
 
@@ -11,7 +11,7 @@ pnpm install --frozen-lockfile
 pnpm run dev
 ```
 
-The command builds the static site, deploys Prisma migrations, and starts Netlify Dev at `http://localhost:8888`. The browser demo uses fictional records in local browser storage. Account mode uses PostgreSQL; it does not use demo records. `.env` is ignored by Git.
+The command builds the static site, deploys Prisma migrations, and starts Netlify Dev at `http://localhost:8888`. Workspace records are server-authoritative and stored in PostgreSQL. `.env` is ignored by Git.
 
 ## Implemented
 
@@ -29,7 +29,8 @@ The command builds the static site, deploys Prisma migrations, and starts Netlif
 - Server-generated multi-page quotation PDFs built only from immutable customer snapshots, plus optional private S3-compatible storage for generated documents and validated RFQ attachments.
 - Structured request logs with request IDs, PostgreSQL health checks, optional webhook error monitoring, optional Upstash distributed limiting for authentication/invitations/public questions, owner data export, and an operator-assisted seven-day organization deletion cooling period.
 - Verified-email enforcement for commercial/sensitive actions, rate-limited verification resend, password/session controls, audited ownership transfer, and self-service user deletion that blocks sole organization Owners.
-- A responsive commercial workspace with an attention-driven dashboard, global keyboard search, live quote profitability, clear approval/send review, accessible forms, professional customer documents, and an isolated fictional demo.
+- A responsive commercial workspace with an attention-driven dashboard, global keyboard search, live quote profitability, clear approval/send review, accessible forms, and professional customer documents.
+- A two-step account and business onboarding flow with browser-locale suggestions and explicit country and currency confirmation. Supported markets include the UAE, United States, Kuwait, Saudi Arabia, Bahrain, Oman, Qatar, United Kingdom, Germany, Canada, Australia and India.
 - `.env.example`, local Postgres compose setup, build scripts, security headers, automated business-rule tests, and browser workflow checks.
 
 ## Configuration
@@ -40,6 +41,6 @@ Netlify build runs `pnpm run build`; publish directory is `dist`; function direc
 
 ## Verification and limits
 
-Run `pnpm run release:check` for Prisma validation/generation, the complete automated suite, and the static build. Provider tests use mocked Gemini, Resend, Stripe, S3, Upstash, and monitoring behavior. RFQs are entered manually or created from user-supplied text; there is no automatic mailbox ingestion. RFQ attachments are securely uploaded but are not automatically OCRed or extracted. The demo is browser-local and fictional; account data is server-authoritative. On 8 October 2026, a clean source-only install passed 50 automated tests, Prisma schema validation/client generation, the static build, and 52 browser workflow/responsive checks. A live PostgreSQL migration attempt failed because no local PostgreSQL server or client tools were available. No Netlify deployment or live provider request was performed. Current classification is `STAGING_READY`; see `RELEASE_STATUS.md` and `STAGING_QUALIFICATION.md`.
+Run `pnpm run release:check` for Prisma validation/generation, the complete automated suite, and the static build. Provider tests use mocked Gemini, Resend, Stripe, S3, Upstash, and monitoring behavior. RFQs are entered manually or created from user-supplied text; there is no automatic mailbox ingestion. RFQ attachments are securely uploaded but are not automatically OCRed or extracted. On 11 October 2026, the current branch passed 64 automated tests, Prisma schema validation/client generation, the static build, and the production dependency advisory check. The existing Netlify staging health endpoint returned 503 because PostgreSQL was unavailable. Live migrations, the revised signup browser flow, and real provider requests remain unverified. Current classification is `STAGING_READY`; see `RELEASE_STATUS.md`, `STAGING_QUALIFICATION.md`, and `RELEASE_READINESS_REPORT.md`.
 
 See [PRODUCT.md](PRODUCT.md), [ARCHITECTURE.md](ARCHITECTURE.md), [SECURITY.md](SECURITY.md), and [DEPLOYMENT.md](DEPLOYMENT.md).

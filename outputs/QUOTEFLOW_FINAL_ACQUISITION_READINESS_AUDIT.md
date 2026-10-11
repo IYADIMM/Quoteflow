@@ -13,10 +13,10 @@
 | Source-only package | PASS | A fresh copy excluded `.git`, `.env`, `node_modules`, `generated`, `dist`, outputs and local work files. |
 | Locked dependency install | PASS | `pnpm install --frozen-lockfile` completed with pnpm 11.25.0 and 1,068 packages. The package declares its pnpm version and explicit dependency build policy. |
 | Prisma schema/client | PASS | Prisma 7.10.0 validated the schema and generated the client from the clean copy. |
-| Automated business rules | PASS | `pnpm run release:check`: 50 passed, 0 failed, followed by `RELEASE_CHECK_PASSED`. |
+| Automated business rules | PASS | Latest `pnpm run release:check`: 64 passed, 0 failed, followed by `RELEASE_CHECK_PASSED`. |
 | Static/Netlify artifact | PASS | `pnpm run build` produced `dist/index.html`, `app.js`, `styles.css` and the supplied logo under `dist/assets/`. |
 | Production dependency audit | PASS | `pnpm audit --prod --audit-level=high`: no known vulnerabilities. |
-| Browser workflow | PASS | 52 checks passed, including demo RFQ/quote/send/public question/acceptance, mixed lines, responsive pages, account API isolation and the rendered product logo. |
+| Browser workflow | PASS | 60 checks passed, including US/USD demo selection, Kuwait/KWD signup and demo selection, three-decimal KWD formatting, demo RFQ/quote/send/public question/acceptance, mixed lines, responsive pages, account API isolation and the rendered product logo. |
 | New PostgreSQL database and migrations | BLOCKED | `pnpm run db:migrate` reached the configured PostgreSQL datasource but no PostgreSQL server, Docker engine or `psql` client exists in this environment. No database was changed. |
 | Database qualification and fresh organization | BLOCKED | The qualification script failed closed because no isolated `STAGING_DATABASE_URL` was supplied. A real signup/organization and server-backed RFQ-to-quotation run therefore could not be honestly verified here. |
 | Netlify deployment | BLOCKED | The build succeeds, but Netlify CLI requires a buyer-owned linked site/project. No Netlify account or site credentials were available. |
@@ -42,6 +42,7 @@
 | Quote workflow | **Implemented and automatically tested.** Server pricing authority, catalog/manual lines, currency rules, approvals, revisions, send attempts, public links and responses are covered. A real PostgreSQL/Resend end-to-end staging run is still blocked. |
 | Provider integrations | **Code-ready, not live-verified.** Stripe, Resend, Gemini, S3, Upstash and monitoring tests use mocks. |
 | Demo | **Browser-local and fictional.** It never proves account persistence or provider delivery. |
+| Country and currency | **Implemented and automated-test covered.** Signup business setup offers explicit market selection with a browser-locale suggestion. Account defaults are validated server-side; no IP geolocation service is used. A current live browser run is still required. |
 | Production readiness | **Not established.** Current status remains `STAGING_READY`. |
 
 ## Undocumented dependency audit
@@ -50,7 +51,7 @@
 - The original OneDrive logo path is not referenced; the image is copied into `assets/quoteflow-logo.png` and built from there.
 - `.env` is ignored and absent from the clean copy. `.env.example` lists the configuration surface.
 - The only credential-like strings found were documented placeholders and test fixtures. No production secret was identified.
-- Account records are server authoritative. `localStorage` is limited to the isolated fictional demo and removal of an obsolete authenticated cache key.
+- Account records are server authoritative. The browser removes the obsolete authenticated cache key instead of persisting business records.
 - No `/api/demo`, production `mailto:` question fallback, SQLite backend, or second application was found.
 
 ## Accounts the buyer must create

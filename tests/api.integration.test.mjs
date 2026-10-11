@@ -28,11 +28,11 @@ test('Netlify API rejects unauthenticated business requests and cookie mutations
 });
 
 test('signup and login persist salted password hashes and issue HttpOnly tenant sessions', async () => {
-  let savedUser, savedSession;
+  let savedUser, savedSession, savedOrganization;
   const prisma = {
     $transaction: async fn => fn({
       user: { create: async ({ data }) => (savedUser = { id: 'user-1', ...data }) },
-      organization: { create: async ({ data }) => ({ id: 'org-1', name: data.name }) },
+      organization: { create: async ({ data }) => { savedOrganization = data; return { id: 'org-1', name: data.name, reportingCurrency: data.reportingCurrency }; } },
       membership: { create: async () => ({ id: 'membership-1' }) },
       session: { create: async ({ data }) => (savedSession = data) }
     }),
@@ -40,12 +40,18 @@ test('signup and login persist salted password hashes and issue HttpOnly tenant 
     session: { create: async ({ data }) => (savedSession = data) }
   };
   const handler = createHandler({ readConfig: () => config, getPrisma: async () => prisma, emailProvider: () => null });
-  const signup = await handler({ path: '/api/auth/signup', httpMethod: 'POST', headers: { origin: config.appUrl }, body: JSON.stringify({ email: 'owner@example.test', organization: 'Example Ltd', password: 'correct-horse-battery-staple' }) });
+  const invalidMarket = await handler({ path: '/api/auth/signup', httpMethod: 'POST', headers: { origin: config.appUrl }, body: JSON.stringify({ email: 'owner@example.test', organization: 'Example Ltd', country: 'XX', currency: 'BTC', password: 'correct-horse-battery-staple' }) });
+  assert.equal(invalidMarket.statusCode, 400);
+  const signup = await handler({ path: '/api/auth/signup', httpMethod: 'POST', headers: { origin: config.appUrl }, body: JSON.stringify({ email: 'owner@example.test', organization: 'Example Ltd', country: 'US', currency: 'USD', password: 'correct-horse-battery-staple', phone: '+1 555 0100', address: '100 Market Street', tax: 7.5, margin: 25, validity: 45, payment: 'Net 15' }) });
   assert.equal(signup.statusCode, 201);
   assert.ok(savedUser.passwordHash.includes(':'));
   assert.equal(JSON.stringify(JSON.parse(signup.body)).includes(savedUser.passwordHash), false);
   assert.equal(signup.multiValueHeaders['set-cookie'].length, 2);
   assert.match(signup.multiValueHeaders['set-cookie'][0], /HttpOnly/);
+  assert.equal(savedOrganization.reportingCurrency, 'USD');
+  assert.deepEqual(savedOrganization.settings.create.data, { company: 'Example Ltd', country: 'US', currency: 'USD', email: 'owner@example.test', phone: '+1 555 0100', address: '100 Market Street', tax: 7.5, margin: 25, validity: 45, payment: 'Net 15', delivery: '', template: 'Modern' });
+  assert.equal(savedOrganization.settings.create.minMargin, '25.0000');
+  assert.equal(savedOrganization.settings.create.quoteValidityDays, 45);
   const login = await handler({ path: '/api/auth/login', httpMethod: 'POST', headers: { origin: config.appUrl }, body: JSON.stringify({ email: 'owner@example.test', password: 'correct-horse-battery-staple' }) });
   assert.equal(login.statusCode, 200);
   assert.deepEqual(JSON.parse(login.body).memberships.map(m => m.role), ['OWNER']);

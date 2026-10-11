@@ -2,10 +2,10 @@
 
 ## STAGING_READY — pending live qualification
 
-The source has passed local clean-install checks and GitHub pull-request CI. The original buyer clean-install run recorded 50 automated tests and 52 fictional browser checks. The targeted launch-audit correction pull request adds regression tests; use the latest GitHub Actions run for the current automated test count. The amended customer maintenance UI still needs its own live browser review after deployment.
+The source previously passed local clean-install checks and GitHub pull-request CI. On 11 October 2026, the current release-candidate branch passed Prisma validation and generation, all 64 automated tests, the static build, and a production dependency advisory check. The revised signup and business onboarding flow has not received a current browser automation run; prior demo-oriented browser evidence is historical and does not qualify this branch. Use the next pull-request CI run for independent evidence.
 
 Source corrections include discount reconciliation, margin policy consistency, customer maintenance, canonical PDF archival, Stripe webhook reconciliation and ordering, strict past-due grace handling, sanitized customer-link logs and serializable quote/team/storage quota reservations.
 
-This is **not** BETA_READY or PRODUCTION_READY. Managed PostgreSQL migrations/runtime, isolated Netlify staging, real Stripe/Resend/Gemini/S3/Upstash/monitoring smoke tests, an independent restore drill and a browser walk-through of the new customer controls remain to be completed.
+This is **not** BETA_READY or PRODUCTION_READY. The connected Netlify staging health endpoint currently returns 503 with `database: unavailable`. Managed PostgreSQL migrations/runtime, a current signup-to-quote browser walk-through, real Stripe/Resend/Gemini/S3/Upstash/monitoring smoke tests, and an independent restore drill remain to be completed.
 
 Do not imply that CI validates credentials, live provider behavior or that these staging gates have passed.
