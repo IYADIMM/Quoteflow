@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomBytes, scryptSync } from 'node:crypto';
-import { createHandler, reserveAIUsage, sanitizedRequestPath } from '../netlify/functions/api.mjs';
+import { createHandler, isQuoteExpired, reserveAIUsage, sanitizedRequestPath } from '../netlify/functions/api.mjs';
 
 const config = { production: false, appUrl: 'https://quoteflow.test', databaseUrl: 'postgres://test', ai: { enabled: true, configured: true, apiKey: 'test-only', model: 'gemini-test', maxRequestsPerMinute: 5, maxInputChars: 2000, monthlyLimits: { FREE: 25, PRO: 500, BUSINESS: 5000 } }, email: { provider: '', apiKey: '', from: '' } };
 const response = async event => {
@@ -147,6 +147,13 @@ test('public responses reject expired quotes', async () => {
   const handler = createHandler({ readConfig: () => config, getPrisma: async () => prisma });
   const result = await handler({ path: `/api/public/quote/${token}`, httpMethod: 'POST', headers: { origin: config.appUrl }, body: JSON.stringify({ action: 'accept', name: 'Buyer', email: 'buyer@example.test', agree: true }) });
   assert.equal(result.statusCode, 404);
+});
+
+test('quote expiry is derived server-side without a continuously running worker', () => {
+  const now = new Date('2026-10-11T12:00:00.000Z');
+  assert.equal(isQuoteExpired({ status: 'SENT', expiryDate: new Date('2026-10-10T23:59:59.999Z') }, now), true);
+  assert.equal(isQuoteExpired({ status: 'SENT', expiryDate: new Date('2026-10-12T23:59:59.999Z') }, now), false);
+  assert.equal(isQuoteExpired({ status: 'ACCEPTED', expiryDate: new Date('2026-10-10T23:59:59.999Z') }, now), false);
 });
 
 test('a same-key retry after send finalization is idempotent without persisting the raw bearer link', async () => {

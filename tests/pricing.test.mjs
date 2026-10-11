@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { calculateQuote } from '../lib/pricing.mjs';
+import { calculateQuote, decimal4 } from '../lib/pricing.mjs';
 
 test('no discount and multiple tax rates are calculated on line values', () => {
   const quote = calculateQuote({ discount: 0, items: [{ qty: 2, price: 100, cost: 40, tax: 5 }, { qty: 1, price: 200, cost: 50, tax: 10 }] });
@@ -26,6 +26,12 @@ test('fixed-point calculations retain four decimal places and reject over-precis
   const quote = calculateQuote({ discount: '0.0100', items: [{ qty: '3.0000', price: '0.1000', cost: '0.0400', tax: '5.0000' }] });
   assert.equal(quote.gross, 0.3); assert.equal(quote.subtotal, 0.29); assert.equal(quote.tax, 0.0145); assert.equal(quote.total, 0.3045);
   assert.throws(() => calculateQuote({ discount: 0, items: [{ qty: 1, price: '1.00001', cost: 0, tax: 0 }] }), /four decimal places/);
+});
+
+test('persisted decimals are normalized without binary floating-point conversion', () => {
+  assert.equal(decimal4('999999999999.9999', 'Price'), '999999999999.9999');
+  assert.equal(decimal4('0.1', 'Tax rate'), '0.1000');
+  assert.throws(() => decimal4('1.00001', 'Price'), /four decimal places/);
 });
 
 test('invalid quantity, negative prices, excessive tax and excessive discount are rejected', () => {

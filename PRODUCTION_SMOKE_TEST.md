@@ -19,4 +19,4 @@ Record date, environment, deploy ID, operator and evidence links. Use fictional 
 
 ### Current execution record — 2026-10-08
 
-Automated release checks pass with 50 tests; Prisma validation/generation and static build pass. Earlier browser workflow QA passed 51 checks. Live steps 1–14 were not executed because PostgreSQL and external provider credentials/endpoints were unavailable. `prisma migrate deploy` was attempted and failed before migration because localhost PostgreSQL was unavailable. Status remains `STAGING_READY`.
+On 11 October 2026, automated release checks pass with 66 tests; Prisma validation/generation, the static build, and the production dependency advisory check pass. Earlier browser workflow evidence predates the current onboarding flow and is not accepted for this candidate. Live steps 1–14 were not executed because PostgreSQL and external provider credentials/endpoints were unavailable. `prisma migrate deploy` was attempted and failed before migration because localhost PostgreSQL was unavailable. Status remains `STAGING_READY`.

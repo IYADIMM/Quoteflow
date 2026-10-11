@@ -9,7 +9,7 @@ Verified on 11 October 2026 against branch `codex/release-candidate-20261011`, b
 | Area | Status | Evidence | Required action |
 | --- | --- | --- | --- |
 | Repository state | PASS | `origin/main` and the starting local `main` both resolved to `cd3f71a`; work moved to a dedicated branch without discarding local changes. | Push the branch and require pull-request CI before review. |
-| Release gate | PASS | `pnpm run release:check` completed Prisma validation, Prisma client generation, 64/64 automated tests, and the static build. | Re-run in pull-request CI. |
+| Release gate | PASS | `pnpm run release:check` completed Prisma validation, Prisma client generation, 66/66 automated tests, and the static build. | Re-run in pull-request CI after pushing the final audit fixes. |
 | Production dependency audit | PASS | `pnpm audit --prod --audit-level high` reported no known vulnerabilities. | Keep the lockfile and rerun before promotion. |
 | October 8 fixes | PASS (source and mocked tests) | Discount allocation, margin policy, customer maintenance, PDF archival, Stripe event ordering, bearer-link log redaction, and serializable quota reservations remain present and their regression tests pass. | Exercise provider and concurrency paths in isolated staging. |
 | Authentication and sessions | PASS (automated) | Signup/login hashing and cookies, CSRF rejection, email-verification gates, recovery controls, session revocation, organization switching, and ownership transfer tests pass. | Live-test verification, recovery, and browser cookies through the staging HTTPS origin. |
